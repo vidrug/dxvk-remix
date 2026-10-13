@@ -159,17 +159,19 @@ void integrate_indirect_pass(uvec2 threadIndex)
 
   // Check if the GBuffer was hit on the Primary and Secondary surfaces
 
-  const bool primaryGBufferMiss = isGBufferMiss(gbufferPixelCoordinate, PrimaryConeRadius);
-  const bool secondaryGBufferMiss = isGBufferMiss(gbufferPixelCoordinate, SecondaryConeRadius);
-
   // Write out empty data
   // Note: This should hopefully prevent any weird undefined data from bleeding into pixels actually being denoised, but
   // may not be needed depending on how the denoiser works.
 
-  bool gbufferMissOfASelectedIntegrationSurface = 
-    geometryFlags.primarySelectedIntegrationSurface
-    ? primaryGBufferMiss 
-    : secondaryGBufferMiss;
+  bool gbufferMissOfASelectedIntegrationSurface;
+  if (geometryFlags.primarySelectedIntegrationSurface)
+  {
+    gbufferMissOfASelectedIntegrationSurface = isGBufferMiss(gbufferPixelCoordinate, PrimaryConeRadius);
+  }
+  else
+  {
+    gbufferMissOfASelectedIntegrationSurface = isGBufferMiss(gbufferPixelCoordinate, SecondaryConeRadius);
+  }
 
   // Note: Early out if no more work on the active surface is needed.
   if (gbufferMissOfASelectedIntegrationSurface)

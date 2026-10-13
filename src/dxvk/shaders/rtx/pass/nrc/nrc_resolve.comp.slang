@@ -361,9 +361,6 @@ void main(uint2 threadIndex: SV_DispatchThreadID)
   const uint sampleIndex = 0;
   const uint samplesPerPixel = push.samplesPerPixel;
 
-  const uint pathIndex = NrcCalculateQueryPathIndex(cb.camera.resolution, pixelCoordinate, sampleIndex, samplesPerPixel);
-  const NrcQueryPathInfo queryPathInfo = NrcUnpackQueryPathInfo(QueryPathInfo[pathIndex]);
-
   vec3 indirectRadiance = vec3(0);
 
   if (push.addPathtracedRadiance)
@@ -372,17 +369,22 @@ void main(uint2 threadIndex: SV_DispatchThreadID)
   }
 
   // Resolve NRC radiance
-  if (queryPathInfo.queryBufferIndex != Nrc::kInvalidQueryBufferIndex)
+  if (push.addNrcRadiance)
   {
-    const vec3 nrcRadiance = queryPathInfo.prefixThroughput * NrcUnpackQueryRadiance(
-      cb.nrcArgs.nrcConstants, QueryRadiance[queryPathInfo.queryBufferIndex]);
+    const uint pathIndex = NrcCalculateQueryPathIndex(cb.camera.resolution, pixelCoordinate, sampleIndex, samplesPerPixel);
+    const NrcQueryPathInfo queryPathInfo = NrcUnpackQueryPathInfo(QueryPathInfo[pathIndex]);
 
-    if (push.addNrcRadiance &&
-        !NrcIsNan(nrcRadiance) && !NrcIsInf(nrcRadiance))
+    if (queryPathInfo.queryBufferIndex != Nrc::kInvalidQueryBufferIndex)
     {
-      indirectRadiance += nrcRadiance;
+      const vec3 nrcRadiance = queryPathInfo.prefixThroughput * NrcUnpackQueryRadiance(
+        cb.nrcArgs.nrcConstants, QueryRadiance[queryPathInfo.queryBufferIndex]);
+
+      if (!NrcIsNan(nrcRadiance) && !NrcIsInf(nrcRadiance))
+      {
+        indirectRadiance += nrcRadiance;
+      }
     }
-  }  
+  }
 
   storeIndirectRadiance(pixelCoordinate, geometryFlags, indirectRadiance);
 }
