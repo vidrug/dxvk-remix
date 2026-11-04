@@ -43,6 +43,9 @@ static const uint visibilityModeAccurateHitDistanceOptional = (1 << 6);
 // The POM self-shadow of an indirect-light query (secondary NEE, the NEE cache, ReSTIR GI). In SCCR mode it is marched
 // coarsely, to rtx.displacement.indirectShadowSteps steps on the ray cone's footprint (sccrIndirectShadowFootprint).
 static const uint visibilityModePomIndirect = (1 << 7);
+// Evaluate only the opacity of opaque hits that cannot be subsurface or eyes, without their normals, tangents, motion
+// or parallax march (from upstream dxvk-remix 8e2dd393). Read by handleVisibilityVertex.
+static const uint visibilityModeLeanOpaqueHits = (1 << 8);
 
 // Alpha-tests visibility rays at a fixed coarse footprint (rtx.shadowRays.coarseAlphaMip).
 // cb.shadowRayAlphaGradient is 1 / rtx.shadowRays.alphaMipTargetResolution. A UV-space gradient of that length makes
@@ -123,7 +126,50 @@ vec3 handleVisibilityVertex<let VisibilityMode : uint>(Ray ray, RayHitInfo rayHi
     }
   }
 
-  SurfaceInteraction surfaceInteraction = surfaceInteractionCreate<requiresNormalsAndTangents ? SurfaceGenerateTangents : SurfaceIgnoreTangents>(surface, rayInteraction, ray, usePreviousTLAS);
+  const uint8_t polymorphicType = rayInteraction.materialType;
+
+  // Lean opaque hits (from upstream dxvk-remix 8e2dd393): an opaque hit that cannot be a thin-opaque or diffusion-profile
+  // subsurface material and is not an eye contributes only 1 - opacity. The opacity needs neither the interpolated normal
+  // and tangents nor the motion, the shadow terminator offset or the parallax march of the hit surface, so none of them is
+  // computed. The material is read here for the one field of the decision, and again for the opacity, so that the material
+  // data is not live across the surface interaction creation.
+  if ((VisibilityMode & visibilityModeLeanOpaqueHits) && polymorphicType == surfaceMaterialTypeOpaque)
+  {
+    const bool mayBeThinOpaqueSubsurface =
+      (VisibilityMode & visibilityModeEnableSubsurfaceMaterials) &&
+      (cb.sssArgs.enableThinOpaque || cb.sssArgs.enableDiffusionProfile) &&
+      opaqueSurfaceMaterialCreate(surfaceMaterials[rayInteraction.surfaceIndex], true).subsurfaceMaterialIndex != SURFACE_INDEX_INVALID;
+
+    if (!mayBeThinOpaqueSubsurface && !(cb.eyeArgs.enableEyes && surface.isEye))
+    {
+      const OpaqueSurfaceMaterial opacityMaterial = opaqueSurfaceMaterialCreate(surfaceMaterials[rayInteraction.surfaceIndex], true);
+
+      Surface opacitySurface = surface;
+      opacitySurface.normalBufferIndex = BINDING_INDEX_INVALID;
+      opacitySurface.normalObjectToWorld = getIdentityMatrix();
+
+      SurfaceInteraction opacityInteraction = surfaceInteractionCreateWithoutMotion<SurfaceIgnoreTangents>(
+        opacitySurface, rayInteraction, ray, usePreviousTLAS);
+
+      if (isSurfaceClipped(opacitySurface, opacityInteraction))
+      {
+        // Ignore parts of surfaces that are under clip planes
+        return vec3(1.0f);
+      }
+
+      // Alpha-test reads use the coarse visibility mip. This does nothing when the option is off.
+      visibilityApplyCoarseAlphaFootprint(opacityInteraction);
+
+      const OpaqueSurfaceMaterialInteraction opacityMaterialInteraction =
+        opaqueSurfaceMaterialInteractionCreateImpl<false>(opacityMaterial, opacitySurface, opacityInteraction, rayInteraction);
+
+      return vec3(1.0f - opacityMaterialInteraction.opacity);
+    }
+  }
+
+  // Note: Nothing below reads the motion or the shadow terminator offset of the surface interaction.
+  SurfaceInteraction surfaceInteraction = surfaceInteractionCreateWithoutMotion<requiresNormalsAndTangents ? SurfaceGenerateTangents : SurfaceIgnoreTangents>(
+    surface, rayInteraction, ray, usePreviousTLAS);
 
   if (isSurfaceClipped(surface, surfaceInteraction))
   {
@@ -133,7 +179,6 @@ vec3 handleVisibilityVertex<let VisibilityMode : uint>(Ray ray, RayHitInfo rayHi
 
   const MemoryPolymorphicSurfaceMaterial memoryPolymorphicSurfaceMaterial = surfaceMaterials[rayInteraction.surfaceIndex];
   
-  const uint8_t polymorphicType = rayInteraction.materialType;
 
   if (polymorphicType == surfaceMaterialTypeOpaque)
   {

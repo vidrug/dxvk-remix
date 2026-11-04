@@ -263,9 +263,9 @@ bool evalNEESecondary(
 
   // Secondary surfaces and the NEE cache are lit indirectly, so they take coarse POM self-shadows (visibilityModePomIndirect).
 #if INDIRECT_SLIM_LEAN_VISIBILITY
-  VisibilityResult visibility = traceVisibilityRay<visibilityModeEnablePom | visibilityModePomIndirect>(minimalSurfaceInteraction,
+  VisibilityResult visibility = traceVisibilityRay<visibilityModeEnablePom | visibilityModePomIndirect | visibilityModeLeanOpaqueHits>(minimalSurfaceInteraction,
 #else
-  VisibilityResult visibility = traceVisibilityRay<visibilityModeEnablePom | visibilityModeEnableTranslucentMaterials | visibilityModePomIndirect>(minimalSurfaceInteraction,
+  VisibilityResult visibility = traceVisibilityRay<visibilityModeEnablePom | visibilityModeEnableTranslucentMaterials | visibilityModePomIndirect | visibilityModeLeanOpaqueHits>(minimalSurfaceInteraction,
 #endif
     lightSample.position, rayMask,
     sampledTransportPortalIndex, portalSpace, pomOpaqueSurfaceEncountered,

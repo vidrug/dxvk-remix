@@ -1041,7 +1041,9 @@ void forkTerrainLayersBlend(
 
 // Opaque Surface Material Interaction Functions
 
-OpaqueSurfaceMaterialInteraction opaqueSurfaceMaterialInteractionCreate(
+// Note: EnablePom can be set to false by callers that do not need the parallax-displaced texture coordinates, such as
+// the opacity of visibility ray hits (visibility.slangh, lean opaque hits). From upstream dxvk-remix 8e2dd393.
+OpaqueSurfaceMaterialInteraction opaqueSurfaceMaterialInteractionCreateImpl<let EnablePom : bool>(
   OpaqueSurfaceMaterial opaqueSurfaceMaterial,
   Surface surface,
   inout SurfaceInteraction surfaceInteraction,
@@ -1070,11 +1072,11 @@ OpaqueSurfaceMaterialInteraction opaqueSurfaceMaterialInteractionCreate(
 #ifdef OPAQUE_MATERIAL_USE_POM
   // The SCCR shell march already placed the texture coordinates, re-framed the interaction and set the depth offset
   // (sccrShellResolve, called by resolveVertex in the G-buffer passes).
-  if (surfaceInteraction.pomShellDone)
+  if (EnablePom && surfaceInteraction.pomShellDone)
   {
     opaqueSurfaceMaterialInteraction.flags |= OPAQUE_SURFACE_MATERIAL_INTERACTION_FLAG_HAS_HEIGHT_TEXTURE;
   }
-  else if (cb.pomMode != DisplacementMode::Off && opaqueSurfaceMaterial.hasValidDisplacement())
+  else if (EnablePom && cb.pomMode != DisplacementMode::Off && opaqueSurfaceMaterial.hasValidDisplacement())
   {
     // pomParallaxFrameNormal is the geometry normal, except with SCCR's stable frame (the triangle normal).
     const mat3 worldToTexture = inverse(transpose(mat3(surfaceInteraction.rawTangent, surfaceInteraction.rawBitangent, pomParallaxFrameNormal(surfaceInteraction))));
@@ -1451,6 +1453,15 @@ OpaqueSurfaceMaterialInteraction opaqueSurfaceMaterialInteractionCreate(
   }
 
   return opaqueSurfaceMaterialInteraction;
+}
+
+OpaqueSurfaceMaterialInteraction opaqueSurfaceMaterialInteractionCreate(
+  OpaqueSurfaceMaterial opaqueSurfaceMaterial,
+  Surface surface,
+  inout SurfaceInteraction surfaceInteraction,
+  MinimalRayInteraction minimalRayInteraction)
+{
+  return opaqueSurfaceMaterialInteractionCreateImpl<true>(opaqueSurfaceMaterial, surface, surfaceInteraction, minimalRayInteraction);
 }
 
 OpaqueSurfaceMaterialInteraction opaqueSurfaceMaterialInteractionCreate(PolymorphicSurfaceMaterialInteraction polymorphicSurfaceMaterialInteraction)
