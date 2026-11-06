@@ -135,6 +135,14 @@ namespace dxvk {
                  "holding 95% of the mesh's texel area, and at least 3. Each level less needs a quarter of the memory\n"
                  "and bake work, so many more meshes fit the Opacity Micromap budget. Rays still alpha-test every\n"
                  "micro-triangle the bake marks unknown, so the image does not change.");
+      RTX_OPTION("rtx.opacityMicromap.building", float, maxItemBudgetFraction, 0.125f,
+                 "The largest share of the Opacity Micromap cache budget one mesh may reserve when it is baked, 0.01 to 1.\n"
+                 "With adaptive subdivision, a mesh whose level would need more than this share takes the next lower\n"
+                 "levels until its array and micromap fit, each a quarter of the memory. Without the cap one mesh of\n"
+                 "tens of thousands of cut-out triangles (a batched grass cell) can ask for most of the budget, fail or\n"
+                 "evict everything else, and the coverage stalls far below 100%. Only 4-state micromaps are capped: they\n"
+                 "stay exact at any level, while a coarser 2-state one (particles, decals, billboards) would alpha-test\n"
+                 "differently. Read when a mesh's level is chosen; 1 = off.");
       // Set to 0 as higher values cause bullet decals on a glass panels to miss parts in Portal RTX
       RTX_OPTION("rtx.opacityMicromap.building", float, decalsMinResolveTransparencyThreshold, 0.f, "Min resolve transparency threshold for decals.");
 
@@ -145,6 +153,10 @@ namespace dxvk {
                  "Max Micro Triangles to bake [Million/Second].\n"
                  "The actual number of issued micro triangles also depends on \"costPerTexelTapPerMicroTriangleBudget\" option.");
       RTX_OPTION("rtx.opacityMicromap.building", int, maxMicroTrianglesToBuildMillionPerSecond, 60 * 5, "Max Micro Triangles to build [Million/Second].");
+      RTX_OPTION("rtx.opacityMicromap.building", float, maxBudgetFrameTimeMs, 40.0f,
+                 "The per-second bake and build budgets are scaled by the last frame's time, up to this time. Without the cap "
+                 "a stalled frame (a resume from a menu, a load) makes the next frame bake many times the usual amount, which "
+                 "stalls that frame too. The same micromaps are baked over the next frames instead. 0 turns the cap off.");
       RTX_OPTION_ENV("rtx.opacityMicromap.building", bool, enableUnlimitedBakingAndBuildingBudgets, false,
         "RTX_OPACITY_MICROMAP_BUILDING_UNLIMITED_BAKING_AND_BUILDING_BUDGETS",
         "Enables unlimited baking and building budgets so that all available Opacity Micromaps are generated in a frame.");
@@ -618,6 +630,28 @@ namespace dxvk {
     size_t getCacheItemCount() const { return m_ommCache.size(); }
     size_t getBlacklistedCount() const { return m_blackListedList.size(); }
     size_t getUnprocessedCount() const { return m_unprocessedList.size(); }
+    // Cache items per state, for [SceneStats]: unprocessed, baking, baked, built, ready; zombies = items in the
+    // unprocessed or baking state that no instance is linked to (their source data was unlinked), which wait for an
+    // instance with their hash to register again.
+    struct CacheStateCounts {
+      uint32_t unprocessed = 0;
+      uint32_t baking = 0;
+      uint32_t baked = 0;
+      uint32_t built = 0;
+      uint32_t ready = 0;
+      uint32_t zombies = 0;
+    };
+    CacheStateCounts getCacheStateCounts() const;
+    // [OmmShadow] detail for one instance: state 0 = no OMM source hash on the instance (never registered, or
+    // filtered by the build-request statistics), 1 = its hash is not in the cache (evicted or blacklisted),
+    // 2 = unprocessed, 3 = baking, 4 = baked, 5 = built/ready. zombie = state 2/3 with no source data linked.
+    struct OmmInstanceState {
+      int state = 0;
+      bool zombie = false;
+      bool blacklisted = false;
+      uint32_t cacheTriangles = 0;
+    };
+    OmmInstanceState getOmmInstanceState(const RtInstance& instance) const;
     // 0 = the instance has no cached OMM source, 1 = its OMM is pending (queued, baking, baked), 2 = built/ready.
     int getOmmReadiness(const RtInstance& instance) const;
 
@@ -921,6 +955,9 @@ namespace dxvk {
       uint64_t mixedTriangles = 0;
       uint64_t budgetBytesReleased = 0;
       uint64_t micromapsPerLevel[13] = {};
+      // rtx.opacityMicromap.building.maxItemBudgetFraction: meshes whose level was lowered, and the levels dropped in all.
+      uint64_t budgetCappedMicromaps = 0;
+      uint64_t budgetCappedLevels = 0;
     };
     CompactStats m_compactStats;
     uint32_t m_compactLogFrame = 0;

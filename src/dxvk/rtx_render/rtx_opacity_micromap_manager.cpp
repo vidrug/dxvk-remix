@@ -837,6 +837,51 @@ namespace dxvk {
     return ommInstanceData.ommSrcHash;
   }
 
+  OpacityMicromapManager::OmmInstanceState OpacityMicromapManager::getOmmInstanceState(const RtInstance& instance) const {
+    OmmInstanceState r;
+    const XXH64_hash_t hash = getOpacityMicromapHash(instance);
+    if (hash == kEmptyHash) {
+      return r;
+    }
+    r.blacklisted = m_blackListedList.find(hash) != m_blackListedList.end();
+    const auto it = m_ommCache.find(hash);
+    if (it == m_ommCache.end()) {
+      r.state = 1;
+      return r;
+    }
+    const OpacityMicromapCacheItem& item = it->second;
+    r.cacheTriangles = item.numTriangles == UINT32_MAX ? 0 : item.numTriangles;
+    switch (item.cacheState) {
+    case OpacityMicromapCacheState::eStep0_Unprocessed: r.state = 2; break;
+    case OpacityMicromapCacheState::eStep1_Baking: r.state = 3; break;
+    case OpacityMicromapCacheState::eStep2_Baked: r.state = 4; break;
+    case OpacityMicromapCacheState::eStep3_Built:
+    case OpacityMicromapCacheState::eStep4_Ready: r.state = 5; break;
+    default: r.state = 1; break;
+    }
+    r.zombie = (r.state == 2 || r.state == 3) && m_cachedSourceData.find(hash) == m_cachedSourceData.end();
+    return r;
+  }
+
+  OpacityMicromapManager::CacheStateCounts OpacityMicromapManager::getCacheStateCounts() const {
+    CacheStateCounts c;
+    for (const auto& [hash, item] : m_ommCache) {
+      switch (item.cacheState) {
+      case OpacityMicromapCacheState::eStep0_Unprocessed: c.unprocessed++; break;
+      case OpacityMicromapCacheState::eStep1_Baking: c.baking++; break;
+      case OpacityMicromapCacheState::eStep2_Baked: c.baked++; break;
+      case OpacityMicromapCacheState::eStep3_Built: c.built++; break;
+      case OpacityMicromapCacheState::eStep4_Ready: c.ready++; break;
+      default: break;
+      }
+      if ((item.cacheState == OpacityMicromapCacheState::eStep0_Unprocessed || item.cacheState == OpacityMicromapCacheState::eStep1_Baking) &&
+          m_cachedSourceData.find(hash) == m_cachedSourceData.end()) {
+        c.zombies++;
+      }
+    }
+    return c;
+  }
+
   OpacityMicromapInstanceData::OpacityMicromapInstanceData()
     : usesOMM(false)
     , needsToCalculateNumTexelsPerMicroTriangle(false)
@@ -1038,8 +1083,42 @@ namespace dxvk {
           areaAbove += numTexelsPerMicroTriangle.texelAreaPerLevel[level];
           level--;
         }
-        numTexelsPerMicroTriangle.subdivisionLevel =
-          static_cast<uint16_t>(std::min(maxSubdivisionLevel, std::max(kMinAdaptiveSubdivisionLevel, level)));
+        level = std::min(maxSubdivisionLevel, std::max(kMinAdaptiveSubdivisionLevel, level));
+
+        // rtx.opacityMicromap.building.maxItemBudgetFraction: one mesh may reserve at most this share of the cache
+        // budget, so its level drops until the array and the micromap fit. The texel footprints below are computed
+        // for the final level. 2-state meshes keep their level: a coarser 2-state micromap would alpha-test
+        // differently, while a 4-state one leaves what it cannot decide to the exact any-hit test at any level.
+        const float budgetFraction = std::clamp(OpacityMicromapOptions::Building::maxItemBudgetFraction(), 0.01f, 1.f);
+        const auto& alphaState = instance.surface.alphaState;
+        const bool twoState = OpacityMicromapOptions::Building::force2StateOpacityMicromaps() ||
+          (OpacityMicromapOptions::Building::allow2StateOpacityMicromaps() &&
+           ((!alphaState.isFullyOpaque && (alphaState.isParticle || alphaState.isDecal)) || alphaState.emissiveBlend));
+        if (budgetFraction < 1.f && !twoState) {
+          // The budget follows the free VRAM and is 0 until it was measured; the configured cap stands in for it then.
+          VkDeviceSize budget = m_memoryManager.getBudget();
+          if (budget == 0) {
+            budget = static_cast<VkDeviceSize>(OpacityMicromapOptions::Cache::maxBudgetSizeMB()) * 1024 * 1024;
+          }
+          const VkDeviceSize itemCap = static_cast<VkDeviceSize>(static_cast<double>(budget) * budgetFraction);
+          const VkIndexType indexType = numTriangles <= UINT16_MAX ? VK_INDEX_TYPE_UINT16 : VK_INDEX_TYPE_UINT32;
+          const uint32_t levelBefore = level;
+          while (level > kMinAdaptiveSubdivisionLevel) {
+            VkDeviceSize arrayBytes = 0;
+            VkDeviceSize blasBytes = 0;
+            calculateRequiredVRamSize(numTriangles, static_cast<uint16_t>(level), VK_OPACITY_MICROMAP_FORMAT_4_STATE_EXT, indexType,
+                                      arrayBytes, blasBytes);
+            if (arrayBytes + blasBytes <= itemCap) {
+              break;
+            }
+            level--;
+          }
+          if (level != levelBefore) {
+            m_compactStats.budgetCappedMicromaps++;
+            m_compactStats.budgetCappedLevels += levelBefore - level;
+          }
+        }
+        numTexelsPerMicroTriangle.subdivisionLevel = static_cast<uint16_t>(level);
       }
     }
     const uint32_t subdivisionLevel = numTexelsPerMicroTriangle.subdivisionLevel;
@@ -2088,7 +2167,14 @@ namespace dxvk {
     case OpacityMicromapCacheState::eStep0_Unprocessed:
     case OpacityMicromapCacheState::eStep1_Baking:
     case OpacityMicromapCacheState::eStep2_Baked:
-      // OMM data is not yet ready
+      // OMM data is not yet ready.
+      // Note (2026-11-05): an item whose source instance was destroyed while it baked keeps its partial array but
+      // leaves the bake queue until an instance with its hash registers again, and a registered instance never
+      // registers again, so such items and every instance sharing their hash stay pending ([SceneStats] zombies).
+      // Re-requesting them here at bind time (rerequestLostMicromap) was tried and made it worse: the host rebuilds
+      // grass batches every few seconds, so the re-linked items restarted over and over, starved the bake budget and
+      // the triangle coverage fell from 78% to 21%. A fix has to re-link the item to a surviving instance of the same
+      // hash at destroyInstance time, without re-registration.
       break;
 
     case OpacityMicromapCacheState::eStep3_Built:
@@ -3029,7 +3115,8 @@ namespace dxvk {
         " (", 100.0 * double(c.mixedTriangles) / double(std::max<uint64_t>(c.triangles, 1)), "%), OMM budget released ",
         double(c.budgetBytesReleased) / (1024.0 * 1024.0), " MiB, budget available ",
         double(m_memoryManager.getAvailable()) / (1024.0 * 1024.0), " of ", double(m_memoryManager.getBudget()) / (1024.0 * 1024.0), " MiB",
-        " | micromaps per subdivision level ", levels, " (adaptive ", OpacityMicromapOptions::Building::adaptiveSubdivision() ? 1 : 0, ")"));
+        " | micromaps per subdivision level ", levels, " (adaptive ", OpacityMicromapOptions::Building::adaptiveSubdivision() ? 1 : 0,
+        ", budget-capped ", c.budgetCappedMicromaps, " meshes by ", c.budgetCappedLevels, " levels)"));
     }
 
     // Clear caches if we need to rebuild OMMs
@@ -3233,7 +3320,9 @@ namespace dxvk {
     // Get the workload scale in respect to 60 Hz for a given frame time.
     // 60 Hz is the baseline since that's what the per-second budgets have been parametrized at in RtxOptions
     const float kFrameTime60Hz = 1 / 60.f;
-    const float frameTimeSecs = GlobalTime::get().deltaTime();
+    const float maxBudgetFrameTimeMs = OpacityMicromapOptions::Building::maxBudgetFrameTimeMs();
+    const float frameTimeSecs = maxBudgetFrameTimeMs > 0.0f
+      ? std::min(GlobalTime::get().deltaTime(), maxBudgetFrameTimeMs * 0.001f) : GlobalTime::get().deltaTime();
     float workloadScalePerSecond = frameTimeSecs / kFrameTime60Hz;
 
     // Modulate the scale for practical FPS range (i.e. <25, 200>) to even out the OMM's per frame percentage performance overhead

@@ -13,6 +13,7 @@
 #include "rtx_scene_manager.h"
 #include "rtx_accel_manager.h"
 #include "rtx_opacity_micromap_manager.h"
+#include "rtx/pass/instance_definitions.h"
 #include "rtx_fork_d3d9_alpha.h"
 #include "rtx_fork_sccr_shell.h"
 #include "rtx_light_manager.h"
@@ -920,6 +921,17 @@ namespace dxvk {
     uint64_t tris = 0, alphaTris = 0, ommUserTris = 0, ommReadyTris = 0;
     uint32_t geomOpaque = 0, geomNonOpaque = 0, solidNonOpaque = 0;
     uint64_t solidNonOpaqueTris = 0;
+    // [OmmShadow]: the any-hit geometry the direct shadow rays can meet (OBJECT_MASK_OPAQUE | OBJECT_MASK_ALPHA_BLEND,
+    // not the unordered TLAS), split into alpha-tested and alpha-blended surfaces, by what the OMM manager holds for it.
+    struct ShadowKind {
+      uint32_t n[8] = {};       // by OmmInstanceState::state 0..5, 6 = ineligible animated, 7 = ineligible other
+      uint64_t tris[8] = {};
+      uint32_t zombies = 0;
+      uint32_t blacklisted = 0;
+    } shadowKinds[3];           // 0 alpha-tested, 1 alpha-blended, 2 other any-hit (clip planes, render targets, ...)
+    struct PendingRec { uint64_t tris; XXH64_hash_t omm; XXH64_hash_t material; uint32_t age; int state; bool zombie; int kind; };
+    std::vector<PendingRec> pending;
+    const bool animatedOmm = OpacityMicromapOptions::BuildRequests::enableAnimatedInstances();
     for (const RtInstance* inst : accel.getOrderedInstances()) {
       if (inst == nullptr) {
         continue;
@@ -931,6 +943,30 @@ namespace dxvk {
       const BlasEntry* blas = inst->getBlas();
       const uint32_t prims = blas ? blas->modifiedGeometryData.calculatePrimitiveCount() : 0;
       tris += prims;
+      if (omm && !inst->isHidden() && !inst->usesUnorderedApproximations() &&
+          (inst->getVkInstance().mask & (OBJECT_MASK_OPAQUE | OBJECT_MASK_ALPHA_BLEND)) != 0 &&
+          ((inst->getGeometryFlags() & VK_GEOMETRY_OPAQUE_BIT_KHR) == 0 ||
+           (inst->getVkInstance().flags & VK_GEOMETRY_INSTANCE_FORCE_NO_OPAQUE_BIT_KHR) != 0)) {
+        const RtSurface::AlphaState& a = inst->surface.alphaState;
+        const int kind = a.isFullyOpaque ? 2 : (a.isBlendingDisabled ? 0 : 1);
+        ShadowKind& k = shadowKinds[kind];
+        int slot;
+        OpacityMicromapManager::OmmInstanceState st;
+        if (!OpacityMicromapManager::usesOpacityMicromap(*inst)) {
+          slot = (inst->isAnimated() && !animatedOmm) ? 6 : 7;
+        } else {
+          st = omm->getOmmInstanceState(*inst);
+          slot = st.state;
+          k.zombies += st.zombie ? 1 : 0;
+          k.blacklisted += st.blacklisted ? 1 : 0;
+        }
+        k.n[slot]++;
+        k.tris[slot] += prims;
+        if (slot <= 4) {
+          pending.push_back(PendingRec { prims, OpacityMicromapManager::getOpacityMicromapHash(*inst), inst->getMaterialDataHash(),
+                                         inst->getFrameAge(), slot, st.zombie, kind });
+        }
+      }
       if (!inst->isOpaque()) {
         alphaTested++;
         alphaTris += prims;
@@ -966,6 +1002,43 @@ namespace dxvk {
       }
     }
 
+    if (omm) {
+      static const char* kKindNames[3] = { "alphaTested", "alphaBlend", "otherAnyHit" };
+      static const char* kSlotNames[8] = { "noHash", "notInCache", "unprocessed", "baking", "baked", "ready", "animatedNoOmm", "ineligible" };
+      std::string line = "[OmmShadow] any-hit instances in the direct shadow mask (n/ktris):";
+      for (int kind = 0; kind < 3; ++kind) {
+        const ShadowKind& k = shadowKinds[kind];
+        uint32_t total = 0;
+        for (int s = 0; s < 8; ++s) {
+          total += k.n[s];
+        }
+        if (total == 0) {
+          continue;
+        }
+        line += str::format(" | ", kKindNames[kind], "=", total);
+        for (int s = 0; s < 8; ++s) {
+          if (k.n[s] != 0) {
+            line += str::format(" ", kSlotNames[s], "=", k.n[s], "/", f2(double(k.tris[s]) / 1000.0));
+          }
+        }
+        if (k.zombies != 0 || k.blacklisted != 0) {
+          line += str::format(" zombies=", k.zombies, " blacklisted=", k.blacklisted);
+        }
+      }
+      std::sort(pending.begin(), pending.end(), [](const PendingRec& x, const PendingRec& y) { return x.tris > y.tris; });
+      const size_t top = std::min<size_t>(pending.size(), 8);
+      if (top != 0) {
+        line += " | heaviest pending:";
+        for (size_t i = 0; i < top; ++i) {
+          const PendingRec& p = pending[i];
+          char hex[64];
+          std::snprintf(hex, sizeof(hex), "omm=%016llx mat=%016llx", static_cast<unsigned long long>(p.omm), static_cast<unsigned long long>(p.material));
+          line += str::format(" [", hex, " ", kKindNames[p.kind], " tris=", p.tris, " age=", p.age, " ", kSlotNames[p.state], p.zombie ? " zombie" : "", "]");
+        }
+      }
+      Logger::info(line);
+    }
+
     uint32_t lightsByType[5] = {};
     for (const auto& [hash, light] : scene.getLightManager().getLightTable()) {
       const uint32_t t = uint32_t(light.getType());
@@ -998,6 +1071,7 @@ namespace dxvk {
     // Render/output resolution from the most recent frame in the ring.
     const FrameRec& last = m_ring[(ctx.getDevice()->getCurrentFrameId()) % kRing];
 
+    const OpacityMicromapManager::CacheStateCounts ommStates = omm ? omm->getCacheStateCounts() : OpacityMicromapManager::CacheStateCounts {};
     Logger::info(str::format("[SceneStats] tlasInstances=", accel.getTlasInstanceCount(),
       " piSlots=", accel.getPointInstancerSlotCount(), " piBatches=", accel.getPointInstancerBatchCount(),
       " surfaces=", instances, " hidden=", hidden,
@@ -1011,6 +1085,8 @@ namespace dxvk {
       " ommCacheItems=", omm ? omm->getCacheItemCount() : 0, " ommUnprocessed=", omm ? omm->getUnprocessedCount() : 0,
       " ommBlacklisted=", omm ? omm->getBlacklistedCount() : 0,
       " ommCacheMiB=", omm ? (omm->getCacheBytesUsed() >> 20) : 0, "/", omm ? (omm->getCacheBudgetBytes() >> 20) : 0,
+      " ommStates=unproc:", ommStates.unprocessed, ",baking:", ommStates.baking, ",baked:", ommStates.baked,
+      ",built:", ommStates.built, ",ready:", ommStates.ready, ",zombies:", ommStates.zombies,
       " | lights=", scene.getLightManager().getLightTable().size(), " active=", scene.getLightManager().getActiveCount(),
       " sphere=", lightsByType[uint32_t(RtLightType::Sphere)], " rect=", lightsByType[uint32_t(RtLightType::Rect)],
       " disk=", lightsByType[uint32_t(RtLightType::Disk)], " cylinder=", lightsByType[uint32_t(RtLightType::Cylinder)],

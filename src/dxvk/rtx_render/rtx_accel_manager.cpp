@@ -2558,7 +2558,11 @@ namespace dxvk {
     relocateDrainingBlases(ctx);
   }
 
-  // Every 8 frames, marks the micromaps held by the merged buckets' BLASes as in use in the OMM cache.
+  // Every 8 frames, marks the micromaps held by the merged buckets' BLASes and by the per-geometry BLASes in the
+  // TLAS as in use in the OMM cache. A per-geometry BLAS binds its micromap once and is not rebuilt while its
+  // geometry stands still, so without this touch the micromap's last use stays at the bind and the
+  // rtx.vramBudget.drainSparseChunks trim (micromaps unused for 600 traced frames) evicts it from a static scene;
+  // the instance then re-registers it (rerequestLostMicromaps), bakes it again and rebuilds the BLAS, over and over.
   void AccelManager::touchMergedBlasMicromaps(OpacityMicromapManager* opacityMicromapManager) {
     // boundOmms is only filled with rtx.ommHoldBoundMicromaps on.
     if (opacityMicromapManager == nullptr || !OpacityMicromapOptions::Cache::keepMergedBlasMicromapsInUse() ||
@@ -2570,6 +2574,11 @@ namespace dxvk {
         continue;
       }
       for (const PooledBlas::BoundOmm& omm : bucket.assignedBlas->boundOmms) {
+        opacityMicromapManager->touchBoundOmm(omm.hash, omm.buffers.ptr());
+      }
+    }
+    for (const Rc<PooledBlas>& blas : m_activeDynamicBlases) {
+      for (const PooledBlas::BoundOmm& omm : blas->boundOmms) {
         opacityMicromapManager->touchBoundOmm(omm.hash, omm.buffers.ptr());
       }
     }
