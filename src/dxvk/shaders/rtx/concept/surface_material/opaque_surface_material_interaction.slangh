@@ -826,6 +826,20 @@ vec3 opaqueSurfaceMaterialAlbedoTint(OpaqueSurfaceMaterial opaqueSurfaceMaterial
   return vec3(1.0f);
 }
 
+// NV-DXVK start: whether the material's diffusion-profile transmittance texture is its albedo texture
+// (SURFACE_MATERIAL_EXTENSION_FLAG_TRANSMITTANCE_TINT, set on the CPU under rtx.subsurface.transmittanceFollowsAlbedo).
+bool opaqueSurfaceMaterialTransmittanceIsAlbedo(OpaqueSurfaceMaterial opaqueSurfaceMaterial)
+{
+  if (opaqueSurfaceMaterial.subsurfaceMaterialIndex == SURFACE_INDEX_INVALID)
+  {
+    return false;
+  }
+  const SubsurfaceMaterial extensionMaterial =
+    subsurfaceMaterialCreate(surfaceMaterialExtensions[opaqueSurfaceMaterial.subsurfaceMaterialIndex]);
+  return (extensionMaterial.flags & SURFACE_MATERIAL_EXTENSION_FLAG_TRANSMITTANCE_TINT) != 0;
+}
+// NV-DXVK end
+
 // The albedo/opacity load and the texture operations of opaqueSurfaceMaterialInteractionCreate, shared with
 // opaqueSurfaceMaterialInteractionCalcOpacity so both run the same code.
 
@@ -1480,6 +1494,17 @@ OpaqueSurfaceMaterialInteraction opaqueSurfaceMaterialInteractionCreate(
 
   opaqueSurfaceMaterialInteraction.subsurfaceMaterialInteraction =
     subSurfaceMaterialReadHelper(opaqueSurfaceMaterial.subsurfaceMaterialIndex, surfaceInteraction, opaqueSurfaceMaterial.samplerIndex);
+  // NV-DXVK start: FaceGen skin under a diffusion profile. A terrain-layers material's albedo is the layer blend (FNV
+  // FaceGen: base + the NPC's offset, times the FaceGen tint, times the albedo tint), but the transmittance - the whole
+  // direct diffuse colour under a diffusion profile - was a second read of the base texture, so the complexion showed
+  // in indirect light only. When the transmittance stands for the albedo (TRANSMITTANCE_TINT), use the blended albedo.
+  if (terrainLayersActive &&
+      opaqueSurfaceMaterialInteraction.subsurfaceMaterialInteraction.maxSampleRadius != 0 &&
+      opaqueSurfaceMaterialTransmittanceIsAlbedo(opaqueSurfaceMaterial))
+  {
+    opaqueSurfaceMaterialInteraction.subsurfaceMaterialInteraction.packedTransmittanceColor = colorToR11G11B10(albedo);
+  }
+  // NV-DXVK end
   opaqueSurfaceMaterialInteraction.dlssControlMask = opaqueSurfaceMaterial.dlssControlMask;
 
   // For an eye, load a secondary texture (iris) and blend on top of primary texture (whites)
