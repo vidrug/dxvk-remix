@@ -127,7 +127,11 @@ namespace dxvk {
     std::atomic<uint32_t>   m_misses { 0 };
     std::atomic<uint32_t>   m_unknown { 0 };
     std::atomic<uint64_t>   m_missMicroseconds { 0 };
-    uint32_t                m_createdAtLastSave = 0;
+    // What the driver cache can have gained: a pipeline compiled or missed. Hits change nothing.
+    uint32_t cacheChanges() const {
+      return m_misses.load() + m_unknown.load() + m_onDemandCompiled.load() + m_backgroundCompiled.load();
+    }
+    uint32_t                m_changesAtLastSave = 0;
     uint32_t                m_createdAtLastSummary = 0;
     dxvk::high_resolution_clock::time_point m_lastSave;
     dxvk::thread            m_saveThread;
