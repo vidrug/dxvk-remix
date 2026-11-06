@@ -92,6 +92,15 @@
 #include "rtx_render/rtx_fork_camera_origin.h"
 #include "rtx_render/rtx_fork_d3d9_alpha.h"
 #include "rtx_render/rtx_fork_d3d9_identity.h"
+#include "rtx_render/rtx_asset_replacer.h"
+#include "rtx_render/rtx_mod_manager.h"
+#include "rtx_render/rtx_materials.h"
+#include <algorithm>
+#include <atomic>
+#include <cstdio>
+#include <fstream>
+#include <iterator>
+#include <unordered_map>
 #include "rtx_render/rtx_host_settings.h"
 #include "rtx_render/rtx_vram_budget.h"
 #include "rtx_render/rtx_session_log.h"
@@ -2990,6 +2999,468 @@ namespace dxvk {
     }
   }
 
+  // Material editor (fork, FNV): the replacement materials the loaded mods carry (opaque and translucent), every
+  // constant of the material edited live through the MaterialData setters (the next draw that binds the material gets a
+  // GPU material built from the new hash: no reload, no file write), and "Save" writing the changed inputs: lines of
+  // that material into the mod's mod.usda in place (the file keeps its identity, so hard links and the file's comments
+  // survive). Labels come from an optional <mod folder>\sss_names.tsv (HASH<TAB>label). "Pick at crosshair" uses the
+  // object-picking readback and selects the replacement whose hash the picked surface reports. Runs on the thread that
+  // processes draws.
+  namespace material_editor {
+    struct Entry {
+      XXH64_hash_t hash = 0;
+      std::string label;
+      std::string mod;
+      std::filesystem::path file;
+      std::shared_ptr<MaterialData> material;
+    };
+
+    struct State {
+      std::vector<Entry> entries;
+      int selected = -1;
+      bool scanned = false;
+      bool wasReloadPending = false;
+      char filter[128] = {};
+      std::optional<MaterialData> original;   // the selected material as it was when selected: Revert, Save diff
+      std::string status;
+      std::atomic<XXH64_hash_t> picked { 0 };
+      std::atomic<bool> pickDone { false };
+      bool pickInFlight = false;
+    };
+    State g_state;
+
+    std::string hashText(XXH64_hash_t hash) {
+      char buf[32];
+      snprintf(buf, sizeof(buf), "%016llX", static_cast<unsigned long long>(hash));
+      return buf;
+    }
+
+    // The shortest plain decimal the file keeps readable: 240, 0.372, 1.
+    std::string numberText(float v) {
+      char buf[32];
+      snprintf(buf, sizeof(buf), "%.4f", v);
+      std::string s = buf;
+      while (!s.empty() && s.back() == '0') {
+        s.pop_back();
+      }
+      if (!s.empty() && s.back() == '.') {
+        s.pop_back();
+      }
+      if (s.empty() || s == "-0") {
+        s = "0";
+      }
+      return s;
+    }
+
+    // USD text of a constant, as the mod files carry it: the attribute's type word and its value.
+    const char* usdType(float) { return "float"; }
+    const char* usdType(bool) { return "bool"; }
+    const char* usdType(const Vector3&) { return "color3f"; }
+    template<typename T> const char* usdType(T) { return "int"; }    // uint8_t and the enums
+    std::string usdValue(float v) { return numberText(v); }
+    std::string usdValue(bool v) { return v ? "1" : "0"; }
+    std::string usdValue(const Vector3& v) { return "(" + numberText(v.x) + ", " + numberText(v.y) + ", " + numberText(v.z) + ")"; }
+    template<typename T> std::string usdValue(T v) { return std::to_string(static_cast<int>(v)); }
+
+    bool same(float a, float b) { return a == b; }
+    bool same(bool a, bool b) { return a == b; }
+    bool same(const Vector3& a, const Vector3& b) { return a.x == b.x && a.y == b.y && a.z == b.z; }
+    template<typename T> bool same(T a, T b) { return static_cast<int>(a) == static_cast<int>(b); }
+
+    // The X-macro ranges in the type the row widget takes.
+    float rangeOf(float v) { return v; }
+    bool rangeOf(bool v) { return v; }
+    Vector3 rangeOf(const Vector3& v) { return v; }
+    template<typename T> int rangeOf(T v) { return static_cast<int>(v); }
+
+    bool editRow(const char* label, float& v, float lo, float hi) {
+      const float speed = (hi - lo) > 100.f ? 1.f : 0.005f;
+      return ImGui::DragFloat(label, &v, speed, lo, hi, "%.4g");
+    }
+    bool editRow(const char* label, bool& v, bool, bool) {
+      return ImGui::Checkbox(label, &v);
+    }
+    bool editRow(const char* label, Vector3& v, const Vector3& lo, const Vector3& hi) {
+      float f[3] = { v.x, v.y, v.z };
+      const bool colour = lo.x >= 0.f && hi.x <= 1.f;
+      const bool changed = colour
+        ? ImGui::ColorEdit3(label, f, ImGuiColorEditFlags_Float | ImGuiColorEditFlags_NoAlpha)
+        : ImGui::DragFloat3(label, f, 0.01f, lo.x, hi.x, "%.4g");
+      if (changed) {
+        v = Vector3(f[0], f[1], f[2]);
+      }
+      return changed;
+    }
+    template<typename T> bool editRow(const char* label, T& v, int lo, int hi) {   // uint8_t and the enums
+      int i = static_cast<int>(v);
+      if (!ImGui::DragInt(label, &i, 0.1f, lo, hi)) {
+        return false;
+      }
+      v = static_cast<T>(std::clamp(i, lo, hi));
+      return true;
+    }
+
+    std::unordered_map<XXH64_hash_t, std::string> readNames(const std::filesystem::path& folder) {
+      std::unordered_map<XXH64_hash_t, std::string> names;
+      std::ifstream in(folder / "sss_names.tsv");
+      std::string line;
+      while (std::getline(in, line)) {
+        if (!line.empty() && line.back() == '\r') {
+          line.pop_back();
+        }
+        const size_t tab = line.find('\t');
+        if (tab == std::string::npos || tab < 16) {
+          continue;
+        }
+        try {
+          names[static_cast<XXH64_hash_t>(std::stoull(line.substr(0, tab), nullptr, 16))] = line.substr(tab + 1);
+        } catch (...) {
+        }
+      }
+      return names;
+    }
+
+    bool hasSelection(const State& s) {
+      return s.selected >= 0 && s.selected < static_cast<int>(s.entries.size());
+    }
+
+    void select(State& s, int index) {
+      s.selected = index;
+      s.original.reset();
+      if (hasSelection(s)) {
+        s.original = *s.entries[index].material;
+      }
+    }
+
+    void scan(State& s, AssetReplacer& replacer) {
+      const XXH64_hash_t keep = hasSelection(s) ? s.entries[s.selected].hash : 0;
+      s.entries.clear();
+      for (const auto& mod : replacer.modManager().mods()) {
+        if (mod->state().progressState != Mod::ProgressState::Loaded) {
+          continue;
+        }
+        const auto names = readNames(mod->filePath().parent_path());
+        for (const auto& [hash, material] : mod->replacements().materialsSnapshot()) {
+          if (!material) {
+            continue;
+          }
+          const MaterialDataType type = material->getType();
+          if (type != MaterialDataType::Opaque && type != MaterialDataType::Translucent) {
+            continue;
+          }
+          Entry e;
+          e.hash = hash;
+          e.material = material;
+          e.mod = mod->name();
+          e.file = mod->filePath();
+          const auto it = names.find(hash);
+          e.label = (it != names.end() ? it->second : "mat_" + hashText(hash)) + "  [" + e.mod + "]" +
+                    (type == MaterialDataType::Translucent ? " (translucent)" : "");
+          s.entries.push_back(std::move(e));
+        }
+      }
+      std::sort(s.entries.begin(), s.entries.end(), [](const Entry& a, const Entry& b) { return a.label < b.label; });
+      int found = -1;
+      for (size_t i = 0; i < s.entries.size(); i++) {
+        if (s.entries[i].hash == keep) {
+          found = static_cast<int>(i);
+        }
+      }
+      s.scanned = true;
+      select(s, found);
+    }
+
+    bool matchesFilter(const State& s, const Entry& e) {
+      if (s.filter[0] == '\0') {
+        return true;
+      }
+      std::string needle = s.filter;
+      std::string hay = e.label + " " + hashText(e.hash);
+      std::transform(needle.begin(), needle.end(), needle.begin(), [](unsigned char c) { return std::tolower(c); });
+      std::transform(hay.begin(), hay.end(), hay.begin(), [](unsigned char c) { return std::tolower(c); });
+      return hay.find(needle) != std::string::npos;
+    }
+
+    struct SaveValue {
+      std::string attr;
+      const char* type;
+      std::string value;
+    };
+
+    // Rewrites the changed inputs: lines of the selected material's block in its mod.usda, in place. A missing line
+    // is inserted before the Shader's outputs:out line with that line's indentation and line ending.
+    bool save(State& s, const std::vector<SaveValue>& values) {
+      const Entry& e = s.entries[s.selected];
+      if (values.empty()) {
+        s.status = "nothing changed since the material was selected";
+        return false;
+      }
+      std::string text;
+      {
+        std::ifstream in(e.file, std::ios::binary);
+        if (!in) {
+          s.status = "cannot read " + e.file.string();
+          return false;
+        }
+        text.assign(std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>());
+      }
+      const std::string head = "def Material \"mat_" + hashText(e.hash) + "\"";
+      const size_t start = text.find(head);
+      if (start == std::string::npos) {
+        s.status = head + " not found in " + e.file.string();
+        return false;
+      }
+      size_t end = text.find("def Material \"", start + head.size());
+      if (end == std::string::npos) {
+        end = text.size();
+      }
+      std::string block = text.substr(start, end - start);
+      for (const SaveValue& v : values) {
+        const std::string key = "inputs:" + v.attr + " = ";
+        const size_t at = block.find(key);
+        if (at != std::string::npos) {
+          size_t eol = block.find('\n', at);
+          if (eol == std::string::npos) {
+            eol = block.size();
+          }
+          size_t valueEnd = eol;
+          if (valueEnd > at && block[valueEnd - 1] == '\r') {
+            valueEnd--;
+          }
+          block.replace(at + key.size(), valueEnd - (at + key.size()), v.value);
+          continue;
+        }
+        const size_t anchor = block.find("outputs:out");
+        if (anchor == std::string::npos) {
+          s.status = "no outputs:out line to add " + v.attr + " before";
+          return false;
+        }
+        size_t lineStart = block.rfind('\n', anchor);
+        lineStart = lineStart == std::string::npos ? 0 : lineStart + 1;
+        size_t ws = lineStart;
+        while (ws < block.size() && (block[ws] == ' ' || block[ws] == '\t')) {
+          ws++;
+        }
+        const std::string indent = block.substr(lineStart, ws - lineStart);
+        const bool crlf = lineStart >= 2 && block[lineStart - 2] == '\r';
+        block.insert(lineStart, indent + v.type + " " + key + v.value + (crlf ? "\r\n" : "\n"));
+      }
+      text.replace(start, end - start, block);
+      std::ofstream out(e.file, std::ios::binary | std::ios::trunc);   // in place: the file keeps its identity (hard links)
+      if (!out) {
+        s.status = "cannot write " + e.file.string();
+        return false;
+      }
+      out.write(text.data(), static_cast<std::streamsize>(text.size()));
+      out.close();
+      s.status = "saved " + std::to_string(values.size()) + " input(s) of mat_" + hashText(e.hash) + " into " + e.file.string() +
+                 " (the mod reloads itself when rtx.usd.reloadOnChanged is on)";
+      return true;
+    }
+
+// The constants of the two material types, mirroring LIST_OPAQUE_MATERIAL_CONSTANTS / LIST_TRANSLUCENT_MATERIAL_CONSTANTS
+// of rtx_material_data.h (which undefines its lists at the end of the header): accessor name, USD attribute, C++ type,
+// range. The texture inputs are not edited here.
+#define FNV_OPAQUE_MATERIAL_ROWS(X) \
+    X(AnisotropyConstant, anisotropy, float, 0.f, 1.f) \
+    X(EmissiveIntensity, emissive_intensity, float, 0.f, 65504.f) \
+    X(AlbedoConstant, diffuse_color_constant, Vector3, Vector3(0.f), Vector3(1.f)) \
+    X(OpacityConstant, opacity_constant, float, 0.f, 1.f) \
+    X(RoughnessConstant, reflection_roughness_constant, float, 0.f, 1.f) \
+    X(MetallicConstant, metallic_constant, float, 0.f, 1.f) \
+    X(EmissiveColorConstant, emissive_color_constant, Vector3, Vector3(0.f), Vector3(1.f)) \
+    X(EnableEmission, enable_emission, bool, false, true) \
+    X(SkyLitParticle, sky_lit_particle, bool, false, true) \
+    X(SpriteSheetRows, sprite_sheet_rows, uint8_t, 0, 255) \
+    X(SpriteSheetCols, sprite_sheet_cols, uint8_t, 0, 255) \
+    X(SpriteSheetFPS, sprite_sheet_fps, uint8_t, 0, 255) \
+    X(EnableThinFilm, enable_thin_film, bool, false, true) \
+    X(AlphaIsThinFilmThickness, thin_film_thickness_from_albedo_alpha, bool, false, true) \
+    X(ThinFilmThicknessConstant, thin_film_thickness_constant, float, 0.001f, 1500.f) \
+    X(UseLegacyAlphaState, use_legacy_alpha_state, bool, false, true) \
+    X(BlendEnabled, blend_enabled, bool, false, true) \
+    X(BlendType, blend_type, BlendType, BlendType::kMinValue, BlendType::kMaxValue) \
+    X(InvertedBlend, inverted_blend, bool, false, true) \
+    X(AlphaTestType, alpha_test_type, AlphaTestType, AlphaTestType::kMinValue, AlphaTestType::kMaxValue) \
+    X(AlphaTestReferenceValue, alpha_test_reference_value, uint8_t, 0, 255) \
+    X(DisplaceIn, displace_in, float, 0.f, 65504.f) \
+    X(DisplaceOut, displace_out, float, 0.f, 65504.f) \
+    X(SubsurfaceTransmittanceColor, subsurface_transmittance_color, Vector3, Vector3(0.f), Vector3(1.f)) \
+    X(SubsurfaceMeasurementDistance, subsurface_measurement_distance, float, 0.f, 65504.f) \
+    X(SubsurfaceSingleScatteringAlbedo, subsurface_single_scattering_albedo, Vector3, Vector3(0.f), Vector3(1.f)) \
+    X(SubsurfaceVolumetricAnisotropy, subsurface_volumetric_anisotropy, float, -1.f, 1.f) \
+    X(SubsurfaceDiffusionProfile, subsurface_diffusion_profile, bool, false, true) \
+    X(SubsurfaceRadius, subsurface_radius, Vector3, Vector3(0.f), Vector3(65504.f)) \
+    X(SubsurfaceRadiusScale, subsurface_radius_scale, float, 0.f, 65504.f) \
+    X(SubsurfaceMaxSampleRadius, subsurface_max_sample_radius, float, 0.f, 65504.f) \
+    X(FilterMode, filter_mode, uint8_t, 0, 1) \
+    X(WrapModeU, wrap_mode_u, uint8_t, 0, 3) \
+    X(WrapModeV, wrap_mode_v, uint8_t, 0, 3) \
+    X(EnableDLSSControlMask, enable_dlss_control_mask, bool, false, true) \
+    X(DLSSControlMaskIntensity, dlss_control_mask_intensity, float, 0.f, 1.f) \
+    X(DLSSControlMaskToneStrength, dlss_control_mask_tone_strength, float, 0.f, 1.f) \
+    X(DLSSControlMaskStructuralStrength, dlss_control_mask_structural_strength, float, 0.f, 1.f) \
+    X(RoughnessEncoding, roughness_encoding, uint8_t, 0, 3) \
+    X(SpecularMetalStrength, specular_metal_strength, float, 0.f, 1.f) \
+    X(SpecularMetalParams, specular_metal_params, Vector3, Vector3(0.f), Vector3(1.f)) \
+    X(SpecularMetalTint, specular_metal_tint, Vector3, Vector3(0.f), Vector3(1.f)) \
+    X(AlbedoTint, albedo_tint, Vector3, Vector3(0.f), Vector3(16.f))
+
+#define FNV_TRANSLUCENT_MATERIAL_ROWS(X) \
+    X(RefractiveIndex, ior_constant, float, 1.f, 3.f) \
+    X(TransmittanceColor, transmittance_color, Vector3, Vector3(0.f), Vector3(1.f)) \
+    X(TransmittanceMeasurementDistance, transmittance_measurement_distance, float, 0.001f, 65504.f) \
+    X(EnableEmission, enable_emission, bool, false, true) \
+    X(EmissiveIntensity, emissive_intensity, float, 0.f, 65504.f) \
+    X(EmissiveColorConstant, emissive_color_constant, Vector3, Vector3(0.f), Vector3(1.f)) \
+    X(SpriteSheetRows, sprite_sheet_rows, uint8_t, 0, 255) \
+    X(SpriteSheetCols, sprite_sheet_cols, uint8_t, 0, 255) \
+    X(SpriteSheetFPS, sprite_sheet_fps, uint8_t, 0, 255) \
+    X(EnableThinWalled, thin_walled, bool, false, true) \
+    X(ThinWallThickness, thin_wall_thickness, float, 0.001f, 65504.f) \
+    X(EnableDiffuseLayer, use_diffuse_layer, bool, false, true) \
+    X(FilterMode, filter_mode, uint8_t, 0, 1) \
+    X(WrapModeU, wrap_mode_u, uint8_t, 0, 3) \
+    X(WrapModeV, wrap_mode_v, uint8_t, 0, 3)
+
+#define FNV_MATERIAL_EDIT_ROW(name, usd_attr, type, minVal, maxVal) \
+    { type value = m.get##name(); if (editRow(#usd_attr, value, rangeOf(minVal), rangeOf(maxVal))) { m.set##name(value); changed = true; } }
+#define FNV_MATERIAL_SAVE_ROW(name, usd_attr, type, minVal, maxVal) \
+    if (!same(m.get##name(), orig.get##name())) { values.push_back({ #usd_attr, usdType(m.get##name()), usdValue(m.get##name()) }); }
+
+    // The rows of the selected material. Returns true when a value changed this frame.
+    bool editRows(MaterialData& material) {
+      bool changed = false;
+      if (material.getType() == MaterialDataType::Opaque) {
+        OpaqueMaterialData& m = material.getOpaqueMaterialData();
+        FNV_OPAQUE_MATERIAL_ROWS(FNV_MATERIAL_EDIT_ROW)
+      } else if (material.getType() == MaterialDataType::Translucent) {
+        TranslucentMaterialData& m = material.getTranslucentMaterialData();
+        FNV_TRANSLUCENT_MATERIAL_ROWS(FNV_MATERIAL_EDIT_ROW)
+      }
+      return changed;
+    }
+
+    std::vector<SaveValue> changedValues(MaterialData& material, const MaterialData& original) {
+      std::vector<SaveValue> values;
+      if (material.getType() == MaterialDataType::Opaque && original.getType() == MaterialDataType::Opaque) {
+        OpaqueMaterialData& m = material.getOpaqueMaterialData();
+        const OpaqueMaterialData& orig = original.getOpaqueMaterialData();
+        FNV_OPAQUE_MATERIAL_ROWS(FNV_MATERIAL_SAVE_ROW)
+      } else if (material.getType() == MaterialDataType::Translucent && original.getType() == MaterialDataType::Translucent) {
+        TranslucentMaterialData& m = material.getTranslucentMaterialData();
+        const TranslucentMaterialData& orig = original.getTranslucentMaterialData();
+        FNV_TRANSLUCENT_MATERIAL_ROWS(FNV_MATERIAL_SAVE_ROW)
+      }
+      return values;
+    }
+
+#undef FNV_MATERIAL_EDIT_ROW
+#undef FNV_MATERIAL_SAVE_ROW
+#undef FNV_OPAQUE_MATERIAL_ROWS
+#undef FNV_TRANSLUCENT_MATERIAL_ROWS
+
+    void show(const Rc<DxvkContext>& ctx, AssetReplacer& replacer) {
+      State& s = g_state;
+      if (!RemixGui::CollapsingHeader("Material Editor (replacement materials of the loaded mods)", collapsingHeaderClosedFlags)) {
+        return;
+      }
+      ImGui::Indent();
+      const bool pending = replacer.isReloadPending();
+      if (!s.scanned || (s.wasReloadPending && !pending)) {
+        scan(s, replacer);
+      }
+      s.wasReloadPending = pending;
+
+      if (s.pickDone.exchange(false)) {
+        s.pickInFlight = false;
+        const XXH64_hash_t h = s.picked.load();
+        int found = -1;
+        for (size_t i = 0; i < s.entries.size(); i++) {
+          if (s.entries[i].hash == h) {
+            found = static_cast<int>(i);
+          }
+        }
+        if (found >= 0) {
+          select(s, found);
+          s.status = "picked " + s.entries[found].label;
+        } else {
+          s.status = h != 0 ? "under the crosshair: texture " + hashText(h) + ", no replacement material for it"
+                            : "under the crosshair: nothing picked";
+        }
+      }
+
+      ImGui::Text("%zu replacement materials in the loaded mods", s.entries.size());
+      if (ImGui::Button("Rescan")) {
+        scan(s, replacer);
+      }
+      ImGui::SameLine();
+      ImGui::BeginDisabled(s.pickInFlight);
+      if (ImGui::Button("Pick at crosshair")) {
+        const ImVec2 size = ImGui::GetIO().DisplaySize;
+        const Vector2i centre { static_cast<int>(size.x * 0.5f), static_cast<int>(size.y * 0.5f) };
+        s.pickInFlight = true;
+        ctx->getCommonObjects()->metaDebugView().ObjectPicking.request(
+          centre, centre + Vector2i { 1, 1 },
+          [](std::vector<ObjectPickingValue>&&, std::optional<XXH64_hash_t> legacyTextureHash) {
+            g_state.picked.store(legacyTextureHash.value_or(0));
+            g_state.pickDone.store(true);
+          });
+      }
+      ImGui::EndDisabled();
+      ImGui::SameLine();
+      ImGui::SetNextItemWidth(260.f);
+      ImGui::InputTextWithHint("##materialFilter", "filter: name, mod, hash", s.filter, sizeof(s.filter));
+
+      if (ImGui::BeginChild("##materialEditorList", ImVec2(0.f, 8.f * ImGui::GetTextLineHeightWithSpacing()), true)) {
+        constexpr int kMaxRows = 400;
+        int shown = 0;
+        int hidden = 0;
+        for (int i = 0; i < static_cast<int>(s.entries.size()); i++) {
+          if (!matchesFilter(s, s.entries[i])) {
+            continue;
+          }
+          if (shown >= kMaxRows) {
+            hidden++;
+            continue;
+          }
+          shown++;
+          const bool selected = i == s.selected;
+          if (ImGui::Selectable(s.entries[i].label.c_str(), selected)) {
+            select(s, i);
+          }
+        }
+        if (hidden > 0) {
+          ImGui::TextDisabled("%d more match the filter", hidden);
+        }
+      }
+      ImGui::EndChild();
+
+      if (hasSelection(s) && s.original.has_value()) {
+        const Entry& e = s.entries[s.selected];
+        ImGui::TextWrapped("mat_%s  %s", hashText(e.hash).c_str(), e.file.string().c_str());
+        ImGui::PushItemWidth(260.f);
+        editRows(*e.material);
+        ImGui::PopItemWidth();
+        const std::vector<SaveValue> changed = changedValues(*e.material, *s.original);
+        ImGui::Text("%zu input(s) changed since the material was selected", changed.size());
+        if (ImGui::Button("Revert")) {
+          *e.material = *s.original;
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("Save changes to mod.usda")) {
+          if (save(s, changed)) {
+            s.original = *e.material;
+          }
+        }
+      }
+      if (!s.status.empty()) {
+        ImGui::TextWrapped("%s", s.status.c_str());
+      }
+      ImGui::Unindent();
+    }
+  }
+
   void ImGUI::showEnhancementsWindow(const Rc<DxvkContext>& ctx) {
     ImGui::PushItemWidth(largeUiMode() ? m_largeWindowWidgetWidth : m_regularWindowWidgetWidth);
 
@@ -3055,6 +3526,8 @@ namespace dxvk {
       showModConflicts(replacer->getModConflictReport());
       ImGui::Unindent();
     }
+
+    material_editor::show(ctx, *replacer);
 
     RemixGui::Separator();
     RemixGui::Checkbox("Highlight Legacy Materials (flash red)", &RtxOptions::useHighlightLegacyModeObject());

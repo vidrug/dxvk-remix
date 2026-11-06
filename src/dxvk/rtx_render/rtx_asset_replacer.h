@@ -221,6 +221,17 @@ namespace dxvk {
       return getCached(m_materials, hash, obj);
     }
 
+    // A copy of the material table (hash, object) taken under the lock, for the dev menu's material editor.
+    std::vector<std::pair<XXH64_hash_t, std::shared_ptr<MaterialData>>> materialsSnapshot() const {
+      std::vector<std::pair<XXH64_hash_t, std::shared_ptr<MaterialData>>> out;
+      std::lock_guard<sync::Spinlock> lock(m_spinlock);
+      out.reserve(m_materials.size());
+      for (const auto& [hash, material] : m_materials) {
+        out.emplace_back(hash, material);
+      }
+      return out;
+    }
+
     bool getGeometry(XXH64_hash_t hash, std::shared_ptr<MeshReplacement>& obj) {
       return getCached(m_geometries, hash, obj);
     }
@@ -551,6 +562,11 @@ namespace dxvk {
     // A copy of the mod order and the clashes between mods, for the UI thread.
     ModConflictReport getModConflictReport() const {
       return m_modManager.conflictReport();
+    }
+
+    // The mods and their replacement tables, for the dev menu's material editor (render thread).
+    ModManager& modManager() {
+      return m_modManager;
     }
 
     // Queues a manual reload of every mod, picked up on the next checkForChanges.

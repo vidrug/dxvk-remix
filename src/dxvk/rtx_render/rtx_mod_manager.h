@@ -170,6 +170,11 @@ public:
     return m_name;
   }
 
+  // The mod's root file (mod.usda), e.g. for the dev menu's material editor, which writes edited inputs back into it.
+  const Path& filePath() const {
+    return m_filePath;
+  }
+
   State state() const {
     return {
       m_progressState.load(std::memory_order_acquire),
