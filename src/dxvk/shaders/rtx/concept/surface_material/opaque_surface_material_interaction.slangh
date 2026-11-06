@@ -545,6 +545,52 @@ float opaqueSurfaceMaterialInteractionCalcHeightThroughputShell(
   return pomSampleVisibility(opaqueSurfaceMaterial, pomCoords.xy, lightDirTangentSpace);
 }
 
+// The shell part of opaqueSurfaceMaterialInteractionCalcHeightThroughputShell alone: false when the pixel takes the plain march
+// (opaqueSurfaceMaterialInteractionCalcHeightThroughputNoShell), which the caller then runs after its scene ray.
+bool opaqueSurfaceMaterialInteractionCalcShellThroughput(
+  MinimalSurfaceInteraction minimalSurfaceInteraction,
+  vec3 rayDirection,
+  OpaqueSurfaceMaterial opaqueSurfaceMaterial,
+  float4 pomCoords,
+  float shadowFootprintUv,
+  uint surfaceIndex,
+  out float visibility,
+  out bool hasShellExit,
+  out vec3 shellExitPosition,
+  out vec3 shellExitNormal)
+{
+  const f16mat3 worldToTangent = f16mat3(
+    minimalSurfaceInteraction.geometryTangent,
+    minimalSurfaceInteraction.geometryBitangent,
+    minimalSurfaceInteraction.geometryNormal);
+  const vec3 lightDirTangentSpace = normalize(mul(worldToTangent, rayDirection));
+  return sccrShellShadowVisibility(minimalSurfaceInteraction, rayDirection, opaqueSurfaceMaterial, pomCoords,
+                                   shadowFootprintUv, surfaceIndex, lightDirTangentSpace, visibility,
+                                   hasShellExit, shellExitPosition, shellExitNormal);
+}
+
+// What opaqueSurfaceMaterialInteractionCalcHeightThroughputShell computes for a pixel the shell march declined.
+float opaqueSurfaceMaterialInteractionCalcHeightThroughputNoShell(
+  MinimalSurfaceInteraction minimalSurfaceInteraction,
+  vec3 rayDirection,
+  OpaqueSurfaceMaterial opaqueSurfaceMaterial,
+  float4 pomCoords,
+  float shadowFootprintUv)
+{
+  const f16mat3 worldToTangent = f16mat3(
+    minimalSurfaceInteraction.geometryTangent,
+    minimalSurfaceInteraction.geometryBitangent,
+    minimalSurfaceInteraction.geometryNormal);
+  const vec3 lightDirTangentSpace = normalize(mul(worldToTangent, rayDirection));
+  if (cb.pomMode == DisplacementMode::SCCR) {
+    return pomSampleVisibility(
+      opaqueSurfaceMaterial, pomCoords.xy,
+      sccrShadowLightDir(minimalSurfaceInteraction, rayDirection, pomCoords, lightDirTangentSpace),
+      sccrDepthScale(pomCoords.z), shadowFootprintUv);
+  }
+  return pomSampleVisibility(opaqueSurfaceMaterial, pomCoords.xy, lightDirTangentSpace);
+}
+
 float opaqueSurfaceMaterialInteractionCalcHeightThroughput(
   MinimalSurfaceInteraction minimalSurfaceInteraction,
   vec3 rayDirection,

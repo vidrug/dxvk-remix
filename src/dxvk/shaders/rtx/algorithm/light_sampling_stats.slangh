@@ -21,7 +21,25 @@ static const uint kLightSamplingStatLongRays = 9;        // shadow rays longer t
 // What the cutout candidates did, over all visibility rays of the direct pass's primary NEE.
 static const uint kLightSamplingStatAlphaCommits = 10;   // candidates that ended the ray as opaque (alpha test passed)
 static const uint kLightSamplingStatPartialHits = 11;    // candidates with 0 < opacity < 1 (ray continues, attenuated)
-static const uint kLightSamplingStatCount = 12;
+// Primary pixels whose material takes the diffusion-profile subsurface path (its own probe, transmission and
+// single-scattering rays on top of the NEE ray), so a frame's direct-pass time can be read against the SSS screen share.
+static const uint kLightSamplingStatSssPixels = 12;
+// rtx.shadowRays.contributionCutoff: local-light rays not traced, and what the dedicated sun / moon ray does.
+static const uint kLightSamplingStatSkipped = 13;
+static const uint kLightSamplingStatSunRays = 14;        // pixels with a sun or moon sample
+static const uint kLightSamplingStatSunOccluded = 15;    // ... whose ray hit something
+static const uint kLightSamplingStatSunCandidates = 16;  // non-opaque candidates of those rays
+static const uint kLightSamplingStatSunSkipped = 17;     // ... whose ray was not traced
+static const uint kLightSamplingStatSunRelativeSkips = 18; // local rays skipped only by the sun-relative test
+// On 1 frame of 8, to keep the atomics out of the timing: how many local-light rays can add at most kContributionBucket[i]
+// (display-linear), of all of them (Base) and of those that were not blocked (VisibleBase).
+static const uint kLightSamplingStatContributionRays = 19;
+static const uint kLightSamplingStatContributionBase = 20;
+static const uint kLightSamplingStatContributionVisibleBase = 28;
+static const uint kLightSamplingStatContributionBuckets = 8;
+static const float kContributionBucket[8] = { 1e-5f, 3e-5f, 1e-4f, 3e-4f, 1e-3f, 3e-3f, 1e-2f, 3e-2f };
+static const uint kLightSamplingStatCount = 36;
+
 
 void lightSamplingStatsAdd(uint slot, uint value)
 {
@@ -29,6 +47,34 @@ void lightSamplingStatsAdd(uint slot, uint value)
   if (WaveIsFirstLane() && waveTotal != 0u)
   {
     InterlockedAdd(LightSamplingStats[slot], waveTotal);
+  }
+}
+
+// contribution: the most the local light could add (stored radiance). skipped: its ray was not traced; occluded counts a
+// skipped ray as blocked, so with the cutoff off the visible counts are the rays a cutoff would change the image of.
+void lightSamplingStatsRecordContribution(float contribution, bool skipped, bool sunRelativeSkip, bool occluded)
+{
+  lightSamplingStatsAdd(kLightSamplingStatSkipped, skipped ? 1u : 0u);
+  lightSamplingStatsAdd(kLightSamplingStatSunRelativeSkips, sunRelativeSkip ? 1u : 0u);
+  if ((cb.frameIdx & 7u) != 0u)
+  {
+    return;
+  }
+  InterlockedAdd(LightSamplingStats[kLightSamplingStatContributionRays], 1u);
+  // The first bucket the contribution fits in. The log sums them up.
+  const float display = contribution / max(cb.shadowRayDisplayToRadiance, 1e-30f);
+  uint bucket = 0u;
+  while (bucket < kLightSamplingStatContributionBuckets && display > kContributionBucket[bucket])
+  {
+    ++bucket;
+  }
+  if (bucket < kLightSamplingStatContributionBuckets)
+  {
+    InterlockedAdd(LightSamplingStats[kLightSamplingStatContributionBase + bucket], 1u);
+    if (!occluded)
+    {
+      InterlockedAdd(LightSamplingStats[kLightSamplingStatContributionVisibleBase + bucket], 1u);
+    }
   }
 }
 

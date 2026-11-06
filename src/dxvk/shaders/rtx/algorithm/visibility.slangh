@@ -43,6 +43,9 @@ static const uint visibilityModeAccurateHitDistanceOptional = (1 << 6);
 // The POM self-shadow of an indirect-light query (secondary NEE, the NEE cache, ReSTIR GI). In SCCR mode it is marched
 // coarsely, to rtx.displacement.indirectShadowSteps steps on the ray cone's footprint (sccrIndirectShadowFootprint).
 static const uint visibilityModePomIndirect = (1 << 7);
+// With visibilityModeAccurateHitDistance, the closest-hit search is dropped while bit 1 of cb.shadowRayFirstHitPrimaryNee
+// (rtx.shadowRays.firstHitSubsurface) is set: the subsurface-path shadow rays, whose hit distance nothing reads.
+static const uint visibilityModeAccurateHitDistanceSubsurfaceOptional = (1 << 8);
 
 // Alpha-tests visibility rays at a fixed coarse footprint (rtx.shadowRays.coarseAlphaMip).
 // cb.shadowRayAlphaGradient is 1 / rtx.shadowRays.alphaMipTargetResolution. A UV-space gradient of that length makes
@@ -304,6 +307,10 @@ struct VisibilityResult {
   bool hasPOMHit;
 };
 
+// rtx.shadowRays.contributionCutoff. The transmission under which this ray's contribution can no longer be seen, set by
+// the NEE callers around the trace (0 = none). The ray then ends as occluded, like the opaqueness threshold below.
+static float g_visibilityTransmissionFloor = 0.0f;
+
 #ifdef LIGHT_SAMPLING_STATS
 // The per-thread count of visibility ray-query candidates, which the caller resets.
 static uint g_lightSamplingStatsCandidates = 0;
@@ -359,7 +366,8 @@ VisibilityResult traceVisibilityRay<let VisibilityMode : uint>(
   // An optional closest-hit search is dropped while cb.shadowRayFirstHitPrimaryNee is set, so the query ends at the
   // first confirmed opaque hit (an opaque or OMM-opaque triangle, or a cutout that passes the alpha test).
   const bool closestHitSearch = (VisibilityMode & visibilityModeAccurateHitDistance) &&
-    !((VisibilityMode & visibilityModeAccurateHitDistanceOptional) && cb.shadowRayFirstHitPrimaryNee != 0);
+    !((VisibilityMode & visibilityModeAccurateHitDistanceOptional) && (cb.shadowRayFirstHitPrimaryNee & 1u) != 0) &&
+    !((VisibilityMode & visibilityModeAccurateHitDistanceSubsurfaceOptional) && (cb.shadowRayFirstHitPrimaryNee & 2u) != 0);
   uint rayFlags = closestHitSearch
     ? RAY_FLAG_NONE
     : RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH;
@@ -446,7 +454,8 @@ VisibilityResult traceVisibilityRay<let VisibilityMode : uint>(
 #endif
 
         // Find an opaque hit
-        if ((1.0f - calcBt709Luminance(result.attenuation)) >= cb.resolveOpaquenessThreshold)
+        if ((1.0f - calcBt709Luminance(result.attenuation)) >= cb.resolveOpaquenessThreshold ||
+            max(result.attenuation.x, max(result.attenuation.y, result.attenuation.z)) <= g_visibilityTransmissionFloor)
         {
           // If opaque hit is not considered in the attenuation term, need to recover previous attenuation.
           if (!clearOpaqueHitAttenuation)
@@ -544,6 +553,9 @@ VisibilityResult traceVisibilityRay<let VisibilityMode : uint>(
 
   // Evaluate POM visibility
   float pomAttenuation = 1.0f;
+  // The plain self-shadow march runs after the scene ray. The two results only multiply, and most rays are blocked by the
+  // scene and need no march (rtx.shadowRays.pomAfterSceneRay). A shell pixel's march can move the ray's origin, so it stays here.
+  bool pomMarchAfterRay = false;
   if ((VisibilityMode & visibilityModeEnablePom) && cb.pomMode != DisplacementMode::Off && pomOpaqueSurfaceEncountered)
   {
     if (cb.debugView == DEBUG_VIEW_HEIGHT_MAP)
@@ -578,21 +590,24 @@ VisibilityResult traceVisibilityRay<let VisibilityMode : uint>(
     if (primarySurfaceIndex != SURFACE_INDEX_INVALID)
     {
       const MemoryPolymorphicSurfaceMaterial memoryPolymorphicSurfaceMaterial = surfaceMaterials[primarySurfaceIndex];
-      if (memoryPolymorphicSurfaceMaterial.hasValidDisplacement())
+      // The march below reads the material. The shell test and the debug views are all that is left in front of the ray.
+      pomMarchAfterRay = memoryPolymorphicSurfaceMaterial.hasValidDisplacement();
+      if (pomMarchAfterRay && cb.pomMode == DisplacementMode::SCCR &&
+          (abs(texCoords.w) >= kSccrShellMarkerBase || cb.debugView == DEBUG_VIEW_SCCR_SHELL_SHADOW))
       {
         // The full material (not the visibility-only one, which drops the FNV layout and with it
         // the terrain-layers index) so a terrain material's blended layer heights self-shadow as they displace.
         OpaqueSurfaceMaterial opaqueSurfaceMaterial = opaqueSurfaceMaterialCreate(memoryPolymorphicSurfaceMaterial);
-        
+
         // Indirect-light queries take coarse SCCR self-shadows.
         const float pomShadowFootprint = (VisibilityMode & visibilityModePomIndirect) != 0 ?
           sccrIndirectShadowFootprint(coneRadius, texCoords) : kSccrFullShadow;
-        bool hasShellExit;
+        bool hasShellExit = false;
         vec3 shellExitPosition;
         vec3 shellExitNormal;
-        pomAttenuation = opaqueSurfaceMaterialInteractionCalcHeightThroughputShell(
+        pomMarchAfterRay = !opaqueSurfaceMaterialInteractionCalcShellThroughput(
           minimalSurfaceInteraction, visibilityRay.direction, opaqueSurfaceMaterial, texCoords, pomShadowFootprint,
-          primarySurfaceIndex, hasShellExit, shellExitPosition, shellExitNormal
+          primarySurfaceIndex, pomAttenuation, hasShellExit, shellExitPosition, shellExitNormal
         );
 
         // A shell pixel's self-shadow march followed the light ray from the relief point to where it leaves the mesh
@@ -629,6 +644,29 @@ VisibilityResult traceVisibilityRay<let VisibilityMode : uint>(
 #endif
 
   VisibilityResult result = traceVisibilityRay<VisibilityMode>(visibilityRay, rayMask, expectedRayPortalIndex, rayOriginPortalSpace, hasRayOriginatedFromViewModel, usePreviousTLAS, clearOpaqueHitAttenuation);
+
+#ifdef OPAQUE_MATERIAL_USE_POM
+  // rtx.shadowRays.pomAfterSceneRay: nothing to march for a ray the scene blocked. A caller that keeps the attenuation of a
+  // blocked ray still gets the march, and so does the off state of the option, for comparing GPU time: it marches every ray
+  // like the order before this change, and on top traces the rays the march alone would have ended.
+  if (pomMarchAfterRay && (!result.hasOpaqueHit || !clearOpaqueHitAttenuation || (cb.shadowRayFirstHitPrimaryNee & 4u) == 0u))
+  {
+    const OpaqueSurfaceMaterial opaqueSurfaceMaterial = opaqueSurfaceMaterialCreate(surfaceMaterials[primarySurfaceIndex]);
+    const float pomShadowFootprint = (VisibilityMode & visibilityModePomIndirect) != 0 ?
+      sccrIndirectShadowFootprint(coneRadius, texCoords) : kSccrFullShadow;
+    pomAttenuation = opaqueSurfaceMaterialInteractionCalcHeightThroughputNoShell(
+      minimalSurfaceInteraction, visibilityRay.direction, opaqueSurfaceMaterial, texCoords, pomShadowFootprint);
+    if (pomAttenuation <= 0.001f)
+    {
+      result.attenuation = pomAttenuation;
+      result.hasOpaqueHit = true;
+      result.rayDirection = visibilityRay.direction;
+      result.hitDistance = visibilityRay.tMax; // TODO should refactor POM code to return?
+      result.hasPOMHit = true;
+      return result;
+    }
+  }
+#endif
 
   // We want to calculate the attenuation from the light to the surface - which is why we use targetPosition (light) and neg-direction (light to surface)
   result.attenuation *= calcVolumetricAttenuation(cb.volumeArgs, none, false, result.hitDistance, targetPosition, -visibilityRay.direction);

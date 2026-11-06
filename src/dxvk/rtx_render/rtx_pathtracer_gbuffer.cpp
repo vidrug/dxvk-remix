@@ -1237,6 +1237,25 @@ namespace dxvk {
       variantBoundEntry = entry;
     }
 
+    // rtx.gbuffer.primaryIgnoresThinFilm. GBUFFER_SLIM_NO_THIN_FILM changes nothing in the primary and decal kernels of the
+    // PSR prepare feature sets: OPAQUE_MATERIAL_USE_THIN_FILM only guards the PSR sampling, which those kernels do not inline.
+    // So a thin-film material needs only PSR prepare and the PSR passes to stay at slimLevel; the rest binds the level the
+    // table gives without the thin-film bit.
+    SlimLevel primaryLevel = slimLevel;
+    if (variantTables && primaryIgnoresThinFilm() && usePSRPrepare && !nrcEnabled && slimLevel == SlimLevel::Full &&
+        ctx->getFrameFeatures().has(RtFrameFeatures::kSceneThinFilm) &&
+        !ctx->getFrameFeatures().hasMode(RtFrameFeatures::kModeThinFilmOverride)) {
+      const VariantSelection primarySelection =
+        selectVariant(kGbufferVariantTable, variantModeKey, ctx->getFrameFeatures().scene & ~RtFrameFeatures::kSceneThinFilm);
+      const SlimLevel candidate = (SlimLevel) kGbufferVariantEntries[primarySelection.entry].level;
+      if (candidate != SlimLevel::Full &&
+          (!variantFallbackActive(*ctx) ||
+           (isVariantComputeShaderReady(*ctx, getComputeShader(rayQueryFeatureVariant, false, nrcEnabled, wboitEnabled, candidate)) &&
+            (!deferUnorderedDecals || isVariantComputeShaderReady(*ctx, getGbufferDecalPrepareSlimComputeShader(candidate)))))) {
+        primaryLevel = candidate;
+      }
+    }
+
     // Primary Rays skip their unordered particle walk, and the deferred decal kernel's particle variant runs it once per pixel.
     // This is only done where that kernel exists and reproduces the inline inputs: RayQuery,
     // WBOIT, a slim level (no portals: the camera ray is the primary ray), PSR Prepare (inline PSR sampling reads the attenuation
@@ -1244,10 +1263,10 @@ namespace dxvk {
     // approximations and decal blending), no debug view or picking (they count / pick on the inline walk), no feature validation
     // (it notes unordered hits inline). While a fallback is active, also only once the particle kernel is compiled.
     bool deferParticles = RtxOptions::renderPassGBufferRaytraceMode() == RaytraceMode::RayQuery &&
-      wboitEnabled && slimLevel != SlimLevel::Full && usePSRPrepare && deferUnorderedDecals &&
+      wboitEnabled && primaryLevel != SlimLevel::Full && usePSRPrepare && deferUnorderedDecals &&
       !debugViewEnabled && !rtOutput.m_raytraceArgs.enableObjectPicking && !RtxOptions::FrameFeatures::validate();
     if (deferParticles && variantTables && variantFallbackActive(*ctx)) {
-      deferParticles = isVariantComputeShaderReady(*ctx, getGbufferDecalPrepareParticlesComputeShader(slimLevel));
+      deferParticles = isVariantComputeShaderReady(*ctx, getGbufferDecalPrepareParticlesComputeShader(primaryLevel));
     }
     if (deferParticles != m_loggedDeferParticles) {
       m_loggedDeferParticles = deferParticles;
@@ -1314,10 +1333,10 @@ namespace dxvk {
       ScopedGpuProfileZone(ctx, "Unordered Decal Prepare");
       // The particle variant whenever Primary Rays skipped their particle walk.
       ctx->bindShader(VK_SHADER_STAGE_COMPUTE_BIT, deferParticles
-        ? getGbufferDecalPrepareParticlesComputeShader(slimLevel)
-        : slimLevel == SlimLevel::Full
+        ? getGbufferDecalPrepareParticlesComputeShader(primaryLevel)
+        : primaryLevel == SlimLevel::Full
         ? getGbufferDecalPrepareComputeShader(decalPrepareVariantKey)
-        : getGbufferDecalPrepareSlimComputeShader(slimLevel));
+        : getGbufferDecalPrepareSlimComputeShader(primaryLevel));
       ctx->dispatch(workgroups.width, workgroups.height, workgroups.depth);
       stamp("GBufferDecals");
     };
@@ -1339,7 +1358,7 @@ namespace dxvk {
           noteFrameFeaturesValidateKernel(FrameFeaturesValidateKernel::GBuffer);
           ctx->bindShader(VK_SHADER_STAGE_COMPUTE_BIT, validateShader);
         } else {
-          ctx->bindShader(VK_SHADER_STAGE_COMPUTE_BIT, getComputeShader(rayQueryFeatureVariant, false, nrcEnabled, wboitEnabled, slimLevel));
+          ctx->bindShader(VK_SHADER_STAGE_COMPUTE_BIT, getComputeShader(rayQueryFeatureVariant, false, nrcEnabled, wboitEnabled, primaryLevel));
         }
         ctx->dispatch(workgroups.width, workgroups.height, workgroups.depth);
       }
@@ -1453,7 +1472,7 @@ namespace dxvk {
     }
 
     if (slimVariants() || compactPsr()) {
-      logSlimLevel(slimLevel, slimFullReason, rayQueryFeatureVariant, nrcEnabled, compactPsrActive,
+      logSlimLevel(primaryLevel != slimLevel ? primaryLevel : slimLevel, slimFullReason, rayQueryFeatureVariant, nrcEnabled, compactPsrActive,
                    ctx->getDevice()->getCurrentFrameId(),
                    variantTables ? variantSelectionToString(kGbufferVariantTable, variantSelection, variantModeKey, variantBoundEntry)
                                  : std::string());

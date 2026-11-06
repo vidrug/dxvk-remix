@@ -76,6 +76,10 @@ namespace dxvk {
                "features the current frame cannot use: displacement, thin-film materials, ray portals and subsurface "
                "materials. Saves GPU time. The image is the same. Only in ray query mode with WBOIT, and with PSR "
                "prepare or with inline PSR and NRC. Other configurations use the full shaders.");
+    RTX_OPTION("rtx.gbuffer", bool, primaryIgnoresThinFilm, true,
+               "A thin-film material no longer takes the primary rays and deferred decals back to the full shaders: thin "
+               "film is only evaluated in PSR prepare and the PSR passes of the PSR prepare configurations, and those "
+               "keep the shader that has it. The image is the same.");
     RTX_OPTION("rtx.gbuffer", bool, compactPsr, true,
                "The reflection and transmission PSR passes run only on the pixels that need them, from lists that PSR "
                "prepare builds, instead of on every pixel. Saves GPU time. The image is the same. Only in ray query "

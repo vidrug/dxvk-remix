@@ -186,6 +186,12 @@ namespace dxvk {
       return str::format("mode=", LightBvh::mode() == LightSamplingMode::Auto ? "Auto:" : "", modeName(LightBvh::effectiveMode()),
         " dedicatedSun=", LightBvh::dedicatedSunActive() ? 1 : 0,
         " firstHitPrimaryNee=", ShadowRays::firstHitPrimaryNee() ? 1 : 0,
+        " firstHitSubsurface=", ShadowRays::firstHitSubsurface() ? 1 : 0,
+        " leanPath=", ShadowRays::directLeanPath() ? 1 : 0,
+        " pomAfterScene=", ShadowRays::pomAfterSceneRay() ? 1 : 0,
+        " cutoff=", ShadowRays::contributionCutoff(),
+        " cutoffSun=", ShadowRays::contributionCutoffSunRelative(),
+        " cutoffIndirectScale=", ShadowRays::contributionCutoffIndirectScale(),
         " coarseAlphaMip=", ShadowRays::coarseAlphaMip() ? 1 : 0,
         " alphaMipRes=", ShadowRays::alphaMipTargetResolution());
     }
@@ -211,6 +217,22 @@ namespace dxvk {
       s.gpu = device->createBuffer(info, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, DxvkMemoryStats::Category::RTXBuffer, "Light Sampling Stats");
     }
     return s.gpu;
+  }
+
+  namespace {
+    // Slots 20.. and 28.. of the statistics: the share of local-light rays under each kContributionBucket value.
+    std::string contributionBuckets(const uint32_t* c) {
+      const double rays = std::max(1.0, double(c[19]));
+      std::string all, visible;
+      double sumAll = 0.0, sumVisible = 0.0;
+      for (uint32_t i = 0; i < 8; ++i) {
+        sumAll += c[20 + i];
+        sumVisible += c[28 + i];
+        all += str::format(i ? "/" : "", 100.0 * sumAll / rays);
+        visible += str::format(i ? "/" : "", 100.0 * sumVisible / rays);
+      }
+      return str::format(" contribAtMost1e-5..3e-2Pct=", all, " contribVisibleAtMost1e-5..3e-2Pct=", visible);
+    }
   }
 
   void lightSamplingStatsAfterDirect(RtxContext* ctx) {
@@ -239,6 +261,15 @@ namespace dxvk {
           " nonOpaqueCandidatesPerPixel=", double(c[5]) / pixels,
           " alphaCommitsPerPixel=", double(c[10]) / pixels,
           " partialHitsPerPixel=", double(c[11]) / pixels,
+          " sssProfilePixelsPct=", 100.0 * c[12] / pixels,
+          " skippedPctOfValid=", 100.0 * c[13] / valid,
+          " sunRelativeSkipPctOfValid=", 100.0 * c[18] / valid,
+          " sunRaysPerPixel=", double(c[14]) / pixels,
+          " sunOccludedPct=", c[14] ? 100.0 * c[15] / double(c[14]) : 0.0,
+          " sunSkippedPct=", c[14] ? 100.0 * c[17] / double(c[14]) : 0.0,
+          " sunCandidatesPerRay=", c[14] ? double(c[16]) / double(c[14]) : 0.0,
+          " contribRays=", c[19],
+          contributionBuckets(c),
           " wavesMixedSunLocalPct=", 100.0 * c[7] / waves,
           " wavesSameLightPct=", 100.0 * c[8] / waves));
       }
@@ -937,6 +968,11 @@ namespace dxvk {
     if (dedicatedSun) {
       // The reservoirs now hold local lights only; an indirect vertex stealing one would lose the sun.
       args.enableRtxdiSampleStealing = 0u;
+    }
+    // The occluded-sample rewrite in the direct pass only serves the sun hint and sample stealing, and the next select pass
+    // overwrites every reservoir. Without those readers it is a load and a store on nearly every pixel for nothing.
+    if (on && args.lightBvhSunOcclusionHint == 0u && args.enableRtxdiSampleStealing == 0u) {
+      args.enableRtxdiDiscardInvisibleSamples = 0u;
     }
     args.lightBvhSelectPassActive = (on && bvhSeparateSelectPass()) ? 1u : 0u;
     args.lightBvhUseSurfaceNormal = bvhUseSurfaceNormal() ? 1u : 0u;

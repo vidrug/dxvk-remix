@@ -512,7 +512,11 @@ struct RaytraceArgs {
   uint serSurfaceCoherenceHintBits;
 
   // Cheaper visibility rays, see rtx_fork_shadow_rays.h and visibility.slangh.
-  // shadowRayFirstHitPrimaryNee: 1 = the primary NEE shadow ray ends at the first confirmed opaque hit.
+  // shadowRayFirstHitPrimaryNee: bit 0 = the primary NEE shadow ray ends at the first confirmed opaque hit,
+  // bit 1 = the subsurface-path shadow rays do (rtx.shadowRays.firstHitSubsurface),
+  // bit 2 = the POM self-shadow march skips rays the scene blocked (rtx.shadowRays.pomAfterSceneRay),
+  // bit 3 = the lean direct path of integrator_direct.slangh (rtx.shadowRays.directLeanPath),
+  // bit 4 = indirect cutout hits test the opacity first (rtx.shadowRays.indirectCutoutOpacityFirst, resolve.slangh).
   // shadowRayAlphaGradient: 1 / rtx.shadowRays.alphaMipTargetResolution, 0 = ray-cone footprint.
   uint shadowRayFirstHitPrimaryNee;
   float shadowRayAlphaGradient;
@@ -570,6 +574,14 @@ struct RaytraceArgs {
   // rtx.resolveKeepsCoplanarSurfaces. 1 = a ray query resolve iteration after a cut-out texel skips only the
   // triangle passed instead of starting behind its plane (resolve_expanded.slangh).
   uint resolveKeepsCoplanarSurfaces;
+
+  // rtx.shadowRays.contributionCutoff*, see rtx_fork_shadow_rays.h. Pre-exposed radiance a shadow ray must be able to
+  // deliver to be traced, negative = off. SunRelative is a fraction of the pixel's visible sun contribution.
+  // shadowRayDisplayToRadiance converts the display-linear scale (1 = white) to pre-exposed radiance.
+  float shadowRayContributionCutoff;
+  float shadowRayContributionCutoffSunRelative;
+  float shadowRayContributionCutoffIndirect;
+  float shadowRayDisplayToRadiance;
 
   // NOTE: Add structs to the top section of RaytraceArgs, not the bottom.
   // NOTE: bool does not work in debug builds, use uint instead.

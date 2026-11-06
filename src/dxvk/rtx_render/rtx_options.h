@@ -622,7 +622,7 @@ namespace dxvk {
 
     // Per-frame feature mask, see rtx_fork_frame_features.h.
     struct FrameFeatures {
-      RTX_OPTION("rtx.frameFeatures", bool, liveMaterialCounts, false,
+      RTX_OPTION("rtx.frameFeatures", bool, liveMaterialCounts, true,
                  "Decides whether a frame needs thin-film, ray portal and thin-opaque shading from the materials still "
                  "in use, instead of from whether such a material was ever created this session. Lets the slim shader "
                  "variants return once those materials are gone. The image is unchanged. [FrameFeatures] in the log "

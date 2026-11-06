@@ -459,6 +459,34 @@ void resolveVertex<T: IBasePayloadState>(
       surfaceInteraction);
 #endif
 
+#ifndef RAY_TRACING_PRIMARY_RAY
+    // rtx.shadowRays.indirectCutoutOpacityFirst. On a transparent texel the path tracer reads only the type and the emission
+    // of what is built below (integratePathVertex), and a material without emission has none, so the rest can wait for the
+    // alpha test. Left out: what can change the opacity besides the albedo read (parallax, eyes, a decal blended into this
+    // hit, and terrain layers where the blend emulation reads the blended albedo: with blending disabled the alpha alone
+    // decides), and the surfaces the branches below treat specially.
+    if ((cb.shadowRayFirstHitPrimaryNee & 16u) != 0u && separateUnorderedApproximations &&
+        !surface.isFullyOpaque && !surface.isEmissiveBlend && !surface.isParticle &&
+        !(cb.eyeArgs.enableEyes && surface.isEye) &&
+        !resolveVertexState.decalEncountered &&
+        !(cb.enableRaytracedRenderTarget && (opaqueSurfaceMaterial.flags & OPAQUE_SURFACE_MATERIAL_FLAG_IS_RAYTRACED_RENDER_TARGET)) &&
+        opaqueSurfaceMaterial.emissiveColorTextureIndex == BINDING_INDEX_INVALID &&
+        opaqueSurfaceMaterial.emissiveIntensity == 0.0f &&
+        !opaqueSurfaceMaterial.hasValidDisplacement() &&
+        (!opaqueSurfaceMaterialIsFnvLayout(opaqueSurfaceMaterial) || surface.isBlendingDisabled) &&
+        opaqueSurfaceMaterialInteractionCalcOpacity(opaqueSurfaceMaterial, surface, surfaceInteraction) <= cb.resolveTransparencyThreshold)
+    {
+      polymorphicSurfaceMaterialInteraction = (PolymorphicSurfaceMaterialInteraction) 0;
+      polymorphicSurfaceMaterialInteraction.type = surfaceMaterialTypeOpaque;
+      isRaytracedRenderTarget = false;
+
+      // Note: Must call resolve final on any return which expects resolving to continue.
+      resolveVertexFinalContinueCutout(ray, surfaceInteraction, teleport, teleportMatrix, resolveVertexState);
+
+      return;
+    }
+#endif
+
     OpaqueSurfaceMaterialInteraction opaqueSurfaceMaterialInteraction =
       opaqueSurfaceMaterialInteractionCreate(opaqueSurfaceMaterial, surface, surfaceInteraction, rayInteraction);
 
