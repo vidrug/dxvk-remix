@@ -627,6 +627,17 @@ void applySkyContribution(
 // miss. radianceThroughput weights the in-scatter.
 // It is skipped while the camera is under water (cb.skyCameraInMedium), where the path tracer's medium
 // owns every ray (NUMOS docs/aerial-perspective-v2.md, 4.4).
+//
+// The glow of lamps in the haze (numosLocalLightGlow) is the costly part, and it depends on the pixel's ray
+// and on where its air ends, not on what is composited: the image and its sky layer ask for the same glow,
+// and a PSR pixel for up to three. Each is evaluated once per pixel and kept here, on NUMOS's scale, under the
+// in-scatter weight (xyz) and the distance (w; -1 on a miss), which a repeated call repeats exactly.
+static const uint kAerialGlowSlots = 4u;
+static vec4 s_aerialGlowKey[kAerialGlowSlots];
+static vec3 s_aerialGlow[kAerialGlowSlots];
+static uint s_aerialGlowUsed = 0u;
+static uint s_aerialGlowNext = 0u;
+
 void applyAerialPerspective(
   uint2 pixelCoordinate,
   bool primaryMiss,
@@ -642,10 +653,38 @@ void applyAerialPerspective(
   }
   const float scale = cb.skyRadianceScale;
   radianceOutput *= scale;
+  // The glow reaches the pixel times this weight: none of it at 0.
+  const vec3 glowWeight = volumeAttenuation * radianceThroughput;
+  vec3 glow = vec3(0.0f);
+  if (any(glowWeight > vec3(0.0f)))
+  {
+    const vec4 key = vec4(glowWeight, primaryMiss ? -1.0f : viewDistance);
+    bool found = false;
+    for (uint i = 0u; i < s_aerialGlowUsed; ++i)
+    {
+      if (all(s_aerialGlowKey[i] == key))
+      {
+        glow = s_aerialGlow[i];
+        found = true;
+        break;
+      }
+    }
+    if (!found)
+    {
+      glow = numosLocalLightGlow(cb.camera, skyArgs, cb.skyHostSkyOverride != 0, SkyApFroxelAux, SkyApLights,
+        SkyApLightClusters, SkyApSampler, pixelCoordinate, primaryMiss, viewDistance, glowWeight, radianceOutput,
+        cb.skyAirlightCutoff, cb.skyAirlightCutoffRelative);
+      const uint slot = s_aerialGlowUsed < kAerialGlowSlots ? s_aerialGlowUsed : s_aerialGlowNext;
+      s_aerialGlowKey[slot] = key;
+      s_aerialGlow[slot] = glow;
+      s_aerialGlowUsed = min(s_aerialGlowUsed + 1u, kAerialGlowSlots);
+      s_aerialGlowNext = (slot + 1u) % kAerialGlowSlots;
+    }
+  }
   numosApplyAerialPerspective(cb.camera, skyArgs, cb.skyHostSkyOverride != 0,
     SkyApNearScatter, SkyApFarScatter, SkyApFarTransmittance, SkyApFroxelAux, SkyApLights, SkyApLightClusters,
     SkyApSampler, pixelCoordinate, primaryMiss, viewDistance, volumeAttenuation, radianceThroughput,
-    cloudOverPixel, radianceOutput);
+    cloudOverPixel, radianceOutput, true, glow);
   radianceOutput /= scale;
 }
 

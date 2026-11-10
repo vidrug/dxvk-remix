@@ -96,6 +96,18 @@ namespace dxvk {
       "Distance in world units over which depth-based fog accumulates. "
       "Distant geometry and the sky retain the fog reached at this distance.");
 
+    RTX_OPTION("rtx.atmosphere", float, localLightGlowCutoff, 3e-5f,
+      "With rtx.atmosphere.aerialPerspectiveLocalLights, the glow of lamps in the haze is computed per pixel for every "
+      "nearby light. A light is left out on a pixel when the most it could add there, together with the lights already "
+      "left out on that pixel, stays under this value on the display-linear scale (1 is display white; 3e-5 is about a "
+      "tenth of an 8-bit step at black). In clear air that is most lights, which otherwise cost as much as the ones in "
+      "fog. 0 computes every light.");
+    RTX_OPTION("rtx.atmosphere", float, localLightGlowCutoffRelative, 0.0f,
+      "Added to rtx.atmosphere.localLightGlowCutoff per color channel: this share of what the pixel already shows. "
+      "An 8-bit step is 0.9 % of a white pixel's value and more of a darker one's, so 0.002 stays under a quarter of a "
+      "step. It applies to surfaces inside the haze's near field. 0 (the default) leaves the fixed value alone: in the "
+      "one interior measured it left out no more lights and cost 0.3 ms.");
+
     RTX_OPTION("rtx", bool, compositePrimaryDirectDiffuse, true, "Enables direct lightning's diffuse signal for primary surfaces in the final composite.");
     RTX_OPTION("rtx", bool, compositePrimaryDirectSpecular, true, "Enables direct lightning's specular signal for primary surfaces in the final composite.");
     RTX_OPTION("rtx", bool, compositePrimaryIndirectDiffuse, true, "Enables indirect lightning's diffuse signal for primary surfaces in the final composite.");

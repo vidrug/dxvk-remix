@@ -138,5 +138,13 @@ struct CompositeArgs {
   float cloudMotionVectorCoverage;
   // The depth a primary miss writes (RaytraceArgs::clearColorDepth). Cloud depth never lies beyond it.
   float cloudMotionVectorMissDepth;
-  uint cloudMotionVectorPad;
+  // How much local-light glow in the haze a pixel may lose to lights left out because they could not add more
+  // (rtx.atmosphere.localLightGlowCutoff), on the sky provider's scale (skyRadianceScale). 0 evaluates every light.
+  float skyAirlightCutoff;
+
+  // On top of it, this share of what the pixel already shows (rtx.atmosphere.localLightGlowCutoffRelative).
+  float skyAirlightCutoffRelative;
+  uint skyAirlightPad0;
+  uint skyAirlightPad1;
+  uint skyAirlightPad2;
 };

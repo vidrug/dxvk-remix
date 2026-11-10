@@ -480,6 +480,16 @@ namespace dxvk {
     ctx->getCommonObjects()->metaNumos().bindCompositeResources(*ctx, compositeArgs.skyProviderActive,
       compositeArgs.skyWorldUnitsPerKm, compositeArgs.skyRadianceScale, compositeArgs.skyHostSkyOverride,
       compositeArgs.skyCloudsValid);
+    // The glow cutoff is given on the display-linear scale. Stored radiance is that times P / trackedExposure
+    // (the tonemapper multiplies by trackedExposure / P), and the sky provider's scale is skyRadianceScale times that.
+    {
+      const float displayToRadiance = PreExposure::get() / std::max(PreExposure::trackedExposure(), 1e-30f);
+      const float cutoff = RtxOptions::useDenoiserReferenceMode() ? 0.0f : localLightGlowCutoff();
+      const float onSkyScale = cutoff * displayToRadiance * compositeArgs.skyRadianceScale;
+      compositeArgs.skyAirlightCutoff = (cutoff > 0.0f && std::isfinite(onSkyScale)) ? onSkyScale : 0.0f;
+      compositeArgs.skyAirlightCutoffRelative =
+        compositeArgs.skyAirlightCutoff > 0.0f ? std::clamp(localLightGlowCutoffRelative(), 0.0f, 1.0f) : 0.0f;
+    }
     // A submerged camera (any start-in medium): no aerial perspective, see composite_args.h.
     compositeArgs.skyCameraInMedium =
       rtOutput.m_raytraceArgs.startInMediumMaterialIndex != SURFACE_INDEX_INVALID ? 1u : 0u;
