@@ -336,6 +336,21 @@ namespace dxvk {
     numos::Settings settings = ctx.getCommonObjects()->metaNumosWeather().update(NumosSettings::resolved(),
                                                                                  GlobalTime::get().deltaTime());
     holdBackUncompiledPasses(ctx, settings);
+    // rtx.weather.gameInterior: the sky is not on screen. Without its render target the cloud screen pass does not run
+    // and the composite does not read it (the same switch as clouds off, which is an exact identity for both); the
+    // direct lighting pass takes no dedicated sun sample (LightBvh::dedicatedSunPrimarySample).
+    const bool interior = NumosWeather::gameInterior();
+    if (interior && !NumosWeather::interiorCloudLayer()) {
+      settings.cloudRenderRTEnable = false;
+    }
+    LightBvh::setInterior(interior);
+    if (interior != m_interiorLogged) {
+      m_interiorLogged = interior;
+      Logger::info(str::format("[Interior] the game reports ", interior ? "an interior" : "no interior",
+                               ": cloud screen pass ", settings.cloudRenderRTEnable ? "on" : "off",
+                               ", dedicated sun sample on the primary surface ",
+                               (!interior || LightBvh::bvhDedicatedSunSampleIndoors()) ? "on" : "off"));
+    }
     m_impl->renderer.setSettings(settings);
 
     Rc<DxvkContext> dxvkCtx = &ctx;

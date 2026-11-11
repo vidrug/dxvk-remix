@@ -61,6 +61,10 @@ namespace dxvk {
     return wanted && active() && dedicatedSunPossible();
   }
 
+  bool LightBvh::dedicatedSunPrimarySample() {
+    return dedicatedSunActive() && (!s_interiorLatched || bvhDedicatedSunSampleIndoors());
+  }
+
   // Auto counts as LightBVH here: it switches to it when the scene has enough lights.
   bool LightBvh::dedicatedSunPossible() {
     const bool wanted = bvhDedicatedSunSample() || bvhDedicatedSunSampleWithSkyProvider();

@@ -113,6 +113,7 @@ namespace dxvk {
     uint32_t m_lastCameraCutFrame = 0;
     uint32_t m_lastWorldChangeCount = 0;  // rtx.skyProvider.worldChangeCount last seen
     bool m_hostSkyOverride = false;
+    bool m_interiorLogged = false; // rtx.weather.gameInterior as last written to the log
     bool m_postDepthDone = false;  // dispatchPostDepth ran since this frame's beginFrame
     bool m_argsCleared = false;    // the args buffer was zeroed once (it is read even while NUMOS is off)
   };

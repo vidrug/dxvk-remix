@@ -123,6 +123,14 @@ namespace dxvk {
                "inside the BVH a moon competing with lamps gets so few samples that moonlit surfaces are noisy at "
                "night.");
 
+    RTX_OPTION("rtx.lightSampling", bool, bvhDedicatedSunSampleIndoors, false,
+               "Takes the dedicated sun sample (rtx.lightSampling.bvhDedicatedSunSample) also while the game integration "
+               "reports an interior (rtx.weather.gameInterior). Off: in an interior the primary surface takes no "
+               "distant-light sample and traces no shadow ray for it, because the sun and the moons are behind the cell's "
+               "walls there and every one of those rays ends on them. A spot the sun reaches through a gap in an "
+               "interior is then no longer lit directly. Indirect lighting, reflections and the sky's own light are "
+               "unchanged.");
+
     // Effective mode for this frame: mode(), with Auto resolved to RTXDI or LightBVH by the last update(). Any value that is
     // not a mode (2, or anything out of range) runs as RTXDI, the default.
     static LightSamplingMode effectiveMode() {
@@ -148,7 +156,13 @@ namespace dxvk {
     // A sky provider (NUMOS) rendered last frame (set by RtxNumos), latched at frame start (latchFrame) so every
     // consumer of dedicatedSunActive agrees within a frame.
     static void setSkyProviderRendering(bool rendering) { s_skyProviderRequested = rendering; }
-    static void latchFrame() { s_skyProviderLatched = s_skyProviderRequested; }
+    static void latchFrame() { s_skyProviderLatched = s_skyProviderRequested; s_interiorLatched = s_interiorRequested; }
+    // The game integration reports an interior (rtx.weather.gameInterior; set by RtxNumos), latched with the sky provider.
+    static void setInterior(bool interior) { s_interiorRequested = interior; }
+    // The integrate direct pass binds its sun variant this frame: dedicatedSunActive(), except in an interior without
+    // rtx.lightSampling.bvhDedicatedSunSampleIndoors. The select pass keeps excluding distant lights either way, so
+    // there the primary surface takes local lights only.
+    static bool dedicatedSunPrimarySample();
 
     // Called by LightManager::prepareSceneData after the light buffer has been written: builds, refits or
     // keeps the BVH and uploads it when it changed. lights are the linearized lights with their current
@@ -233,6 +247,8 @@ namespace dxvk {
   private:
     static inline bool s_skyProviderRequested = false;
     static inline bool s_skyProviderLatched = false;
+    static inline bool s_interiorRequested = false;
+    static inline bool s_interiorLatched = false;
   };
 
 } // namespace dxvk

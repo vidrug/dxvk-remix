@@ -72,6 +72,14 @@ namespace dxvk {
     RTX_OPTION_FLAG("rtx.weather", float, gameWeatherBlend, -1.0f, RtxOptionFlags::NoSave,
       "Set by the game integration: 0..1 = the game's own blend from rtx.weather.gameWeatherOutgoing to "
       "rtx.weather.gameWeather; negative = the runtime blends over the preset's transition time.");
+    RTX_OPTION_FLAG("rtx.weather", bool, gameInterior, false, RtxOptionFlags::NoSave,
+      "Set by the game integration: the camera is in an interior, where the sky is not on screen and the sun and the "
+      "moons are behind the cell's walls. The sky keeps lighting the scene. See rtx.weather.interiorCloudLayer and "
+      "rtx.lightSampling.bvhDedicatedSunSampleIndoors for what is left out there.");
+    RTX_OPTION("rtx.weather", bool, interiorCloudLayer, false,
+      "Draws the cloud layer on screen also while the game integration reports an interior (rtx.weather.gameInterior). "
+      "Off: the cloud screen pass does not run there, so sky seen through a gap in an interior shows no clouds. "
+      "Cloud shadows, the sky's light and the sky secondary rays see are unchanged.");
     RTX_OPTION_FLAG("rtx.weather", std::string, legacyPresetFile, std::string(""), RtxOptionFlags::NoSave,
       "A weather preset file in the older single-file format ([name] sections with coverage, density, layer2... keys) "
       "to convert into preset files in rtx.weather.presetDirectory. Each section is converted once; a preset of the same "

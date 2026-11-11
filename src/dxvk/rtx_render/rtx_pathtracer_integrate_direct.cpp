@@ -401,7 +401,7 @@ namespace dxvk {
       if (isSplitLevel(slimLevel) && !deferredNrcTrainingSetup &&
           prepareSplitRecords(rtOutput.m_raytraceArgs.camera.resolution.x, rtOutput.m_raytraceArgs.camera.resolution.y, frameId)) {
         ctx->bindResourceBuffer(INTEGRATE_DIRECT_BINDING_SPLIT_RECORDS, DxvkBufferSlice(m_splitRecords, 0, m_splitRecords->info().size));
-        ctx->bindShader(VK_SHADER_STAGE_COMPUTE_BIT, getSplitShadeShader(LightBvh::dedicatedSunActive()));
+        ctx->bindShader(VK_SHADER_STAGE_COMPUTE_BIT, getSplitShadeShader(LightBvh::dedicatedSunPrimarySample()));
         sparseRendering.dispatchLaunch(*ctx, sparseArgs, COMPACT_ACTIVE_PIXELS_LAUNCH_INTEGRATE_DIRECT, workgroups);
         ctx->bindShader(VK_SHADER_STAGE_COMPUTE_BIT, getSplitTraceShader(slimLevel));
         sparseRendering.dispatchLaunch(*ctx, sparseArgs, COMPACT_ACTIVE_PIXELS_LAUNCH_INTEGRATE_DIRECT, workgroups);
@@ -608,7 +608,7 @@ namespace dxvk {
 
     // rtx.frameFeatures.validate. The Full kernels' validation variants (sampled light types).
     if (RtxOptions::FrameFeatures::validate()) {
-      return LightBvh::dedicatedSunActive()
+      return LightBvh::dedicatedSunPrimarySample()
         ? GET_SHADER_VARIANT(VK_SHADER_STAGE_COMPUTE_BIT, IntegrateDirectRayGenShader, integrate_direct_sun_validate_rayquery)
         : GET_SHADER_VARIANT(VK_SHADER_STAGE_COMPUTE_BIT, IntegrateDirectRayGenShader, integrate_direct_validate_rayquery);
     }
@@ -619,7 +619,7 @@ namespace dxvk {
     // The Lean levels normally run as the split kernels. They bind the NoSss kernel only when the record buffer cannot be
     // allocated, and NoSss computes everything a Lean level does.
     const bool full = slimLevel == SlimLevel::Full;
-    if (LightBvh::dedicatedSunActive()) {
+    if (LightBvh::dedicatedSunPrimarySample()) {
       return full
         ? GET_SHADER_VARIANT(VK_SHADER_STAGE_COMPUTE_BIT, IntegrateDirectRayGenShader, integrate_direct_sun_rayquery)
         : GET_SHADER_VARIANT(VK_SHADER_STAGE_COMPUTE_BIT, IntegrateDirectRayGenShader, integrate_direct_sun_nosss_rayquery);
@@ -657,7 +657,7 @@ namespace dxvk {
 
   bool DxvkPathtracerIntegrateDirect::isLevelReady(RtxContext& ctx, const bool deferredNrcTrainingSetup, const SlimLevel level) const {
     if (isSplitLevel(level) && !deferredNrcTrainingSetup) {
-      return isVariantComputeShaderReady(ctx, getSplitShadeShader(LightBvh::dedicatedSunActive())) &&
+      return isVariantComputeShaderReady(ctx, getSplitShadeShader(LightBvh::dedicatedSunPrimarySample())) &&
              isVariantComputeShaderReady(ctx, getSplitTraceShader(level));
     }
     return isVariantComputeShaderReady(ctx, getComputeShader(deferredNrcTrainingSetup, level));
