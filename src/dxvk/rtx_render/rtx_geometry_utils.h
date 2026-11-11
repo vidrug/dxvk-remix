@@ -111,6 +111,9 @@ namespace dxvk {
       
       float costPerTexelTapPerMicroTriangleBudget;
       const std::vector<uint16_t>& numTexelsPerMicrotriangle;
+      // rtx.opacityMicromap.building.shareEqualTriangles: uint32 per baked triangle, the mesh triangle whose texcoords
+      // and vertex opacities it takes. Null: baked triangle i is mesh triangle triangleOffset + i.
+      Rc<DxvkBuffer> triangleTable;
 
       BakeOpacityMicromapDesc(const std::vector<uint16_t>& _numTexelsPerMicrotriangle)
         : numTexelsPerMicrotriangle(_numTexelsPerMicrotriangle) { }

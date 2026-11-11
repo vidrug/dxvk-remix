@@ -33,6 +33,9 @@
 #define BINDING_BAKE_OPACITY_MICROMAP_CONSTANTS                   4
 
 #define BINDING_BAKE_OPACITY_MICROMAP_ARRAY_OUTPUT                5
+// rtx.opacityMicromap.building.shareEqualTriangles: uint32 per baked triangle, the mesh triangle it is baked from
+// (read when useTriangleTable is set; any buffer is bound otherwise).
+#define BINDING_BAKE_OPACITY_MICROMAP_TRIANGLE_TABLE_INPUT        6
 
 #define BAKE_OPACITY_MICROMAP_NUM_THREAD_PER_COMPUTE_BLOCK        256
 
@@ -75,4 +78,9 @@ struct BakeOpacityMicromapArgs {
   uint threadIndexOffset;
   uint conservativeEstimationMaxTexelTapsPerMicroTriangle;
   uint numActiveThreads;
+
+  uint useTriangleTable; // baked triangle i reads mesh triangle TriangleTable[i] (triangleOffset is 0 then)
+  uint pad0;
+  uint pad1;
+  uint pad2;
 };

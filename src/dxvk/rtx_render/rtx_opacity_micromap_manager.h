@@ -165,6 +165,14 @@ namespace dxvk {
                  "evict everything else, and the coverage stalls far below 100%. Only 4-state micromaps are capped: they\n"
                  "stay exact at any level, while a coarser 2-state one (particles, decals, billboards) would alpha-test\n"
                  "differently. Read when a mesh's level is chosen; 1 = off.");
+      RTX_OPTION("rtx.opacityMicromap.building", bool, shareEqualTriangles, true,
+                 "Bakes one micromap for all the triangles of a mesh that have the same texture coordinates (and vertex\n"
+                 "opacities) in the same order, and points the indices of the other triangles at it. A micromap depends on\n"
+                 "nothing else of a triangle, so the result is the one baked per triangle. A static collection that repeats\n"
+                 "one plant, or leaf cards cut from one image, then takes a fraction of the bake time and of the cache\n"
+                 "budget, and keeps its subdivision level under rtx.opacityMicromap.building.maxItemBudgetFraction. Needs\n"
+                 "rtx.opacityMicromap.building.adaptiveSubdivision and rtx.alphaBake.compactMicromaps; a mesh shares when\n"
+                 "at most three quarters of its triangles are distinct. Read when a mesh's level is chosen.");
       // Set to 0 as higher values cause bullet decals on a glass panels to miss parts in Portal RTX
       RTX_OPTION("rtx.opacityMicromap.building", float, decalsMinResolveTransparencyThreshold, 0.f, "Min resolve transparency threshold for decals.");
 
@@ -373,6 +381,17 @@ namespace dxvk {
     Rc<DxvkBuffer> compactCounter;
     uint32_t compactDispatchFrame = 0;
 
+    // rtx.opacityMicromap.building.shareEqualTriangles. Set when the array's memory is reserved: the array, the compact
+    // pass and the micromap then hold numSharedSlots triangles (the distinct ones) instead of numTriangles.
+    uint32_t numSharedSlots = 0;                 // 0: every triangle is baked
+    std::vector<uint32_t> sharedSlotOfTriangle;  // per mesh triangle: its slot; dropped once the index buffer is written
+    std::vector<uint16_t> sharedSlotTexels;      // per slot: texel taps per micro-triangle, for the bake budget
+    Rc<DxvkBuffer> sharedSlotTriangleBuffer;     // per slot: the mesh triangle the bake shader reads (uint32)
+    // The triangles the array holds.
+    uint32_t numBakedTriangles(uint32_t numMeshTriangles) const {
+      return numSharedSlots != 0 ? numSharedSlots : numMeshTriangles;
+    }
+
     // rtx.alphaBake.softwareOmm. The software store: numTriangles index words (special
     // index or mixed slot) followed by wordsPerTriangle data words per mixed triangle, in one buffer with a slot in the
     // scene's bindless raw-buffer table (acquired when a surface first uses it).
@@ -410,6 +429,10 @@ namespace dxvk {
     , compactTriangleArray(src.compactTriangleArray)
     , compactCounter(src.compactCounter)
     , compactDispatchFrame(src.compactDispatchFrame)
+    , numSharedSlots(src.numSharedSlots)
+    , sharedSlotOfTriangle(src.sharedSlotOfTriangle)
+    , sharedSlotTexels(src.sharedSlotTexels)
+    , sharedSlotTriangleBuffer(src.sharedSlotTriangleBuffer)
     , softStore(src.softStore)
     , softNumMixed(src.softNumMixed)
     , softBindlessIndex(src.softBindlessIndex)
@@ -778,6 +801,17 @@ namespace dxvk {
       uint32_t numTrianglesScanned = 0;
       double texelAreaPerLevel[kNumLevelBins] = {};
       uint16_t subdivisionLevel = UINT16_MAX;
+
+      // rtx.opacityMicromap.building.shareEqualTriangles. The level scan gives every triangle the slot of the first
+      // triangle with the same texcoords (and vertex opacities) in the same order. slotTriangle stays empty when the
+      // mesh does not share (too many distinct triangles, or the scan could not compare them).
+      std::vector<uint32_t> slotOfTriangle;                   // per triangle, while scanning and when sharing
+      std::vector<uint32_t> slotTriangle;                     // per slot: its first triangle
+      std::unordered_map<XXH64_hash_t, uint32_t> slotByKey;   // while scanning
+      bool shareScan = false;                                 // the scan compares triangles
+      bool isSharing() const {
+        return subdivisionLevel != UINT16_MAX && !slotTriangle.empty();
+      }
     };
 
     static uint32_t calculateNumTexelsPerMicroTriangle(Vector2 triangleTexcoords[3], float rcpNumMicroTrianglesAlongEdge, Vector2 textureResolution);
@@ -996,6 +1030,11 @@ namespace dxvk {
       // rtx.opacityMicromap.building.maxItemBudgetFraction: meshes whose level was lowered, and the levels dropped in all.
       uint64_t budgetCappedMicromaps = 0;
       uint64_t budgetCappedLevels = 0;
+      // rtx.opacityMicromap.building.shareEqualTriangles: meshes built from their distinct triangles, the triangles
+      // of those meshes and the distinct ones among them.
+      uint64_t sharedMicromaps = 0;
+      uint64_t sharedTriangles = 0;
+      uint64_t sharedSlots = 0;
     };
     CompactStats m_compactStats;
     uint32_t m_compactLogFrame = 0;

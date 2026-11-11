@@ -1093,11 +1093,72 @@ namespace dxvk {
         numTexelsPerMicroTriangle.subdivisionLevel = static_cast<uint16_t>(maxSubdivisionLevel);
       } else {
         using Data = NumTexelsPerMicroTriangleCalculationData;
+
+        // rtx.opacityMicromap.building.shareEqualTriangles: what the bake shader reads of a triangle, as stored.
+        struct TriangleKey {
+          float texcoords[6];
+          uint32_t opacities;
+        };
+        static_assert(sizeof(TriangleKey) == 28, "hashed and compared as bytes");
+        const auto getTriangleKey = [&](uint32_t iTriangle, TriangleKey& key) {
+          key.opacities = 0;
+          for (uint32_t i = 0; i < kNumIndicesPerTriangle; i++) {
+            uint32_t index = iTriangle * kNumIndicesPerTriangle + i;
+            if (usesIndices) {
+              if (has16bitIndices) {
+                index = bufferData.getIndex(index);
+              } else {
+                // getIndex32 reads 16 bits
+                std::memcpy(&index, reinterpret_cast<const uint8_t*>(bufferData.indexData) + size_t(index) * sizeof(uint32_t), sizeof(uint32_t));
+              }
+            }
+            const Vector2& texcoord = bufferData.getTexCoord(index);
+            key.texcoords[2 * i] = texcoord.x;
+            key.texcoords[2 * i + 1] = texcoord.y;
+            if (bufferData.vertexColorData != nullptr) {
+              key.opacities |= (bufferData.getVertexColor(index) >> 24) << (8 * i);
+            }
+          }
+        };
+        if (numTexelsPerMicroTriangle.numTrianglesScanned == 0) {
+          constexpr uint32_t kMinTrianglesToShare = 64;
+          numTexelsPerMicroTriangle.slotOfTriangle.clear();
+          numTexelsPerMicroTriangle.slotTriangle.clear();
+          numTexelsPerMicroTriangle.slotByKey.clear();
+          // 32-bit indices are read as stored only from a buffer of 4-byte elements
+          numTexelsPerMicroTriangle.shareScan =
+            OpacityMicromapOptions::Building::shareEqualTriangles() && RtxOptions::compactMicromaps() && !m_software &&
+            numTriangles >= kMinTrianglesToShare && !usesSplitBillboardOpacityMicromap(instance) &&
+            (!usesIndices || has16bitIndices || geometryData.indexBuffer.stride() == sizeof(uint32_t));
+          if (numTexelsPerMicroTriangle.shareScan) {
+            numTexelsPerMicroTriangle.slotOfTriangle.resize(numTriangles);
+          }
+        }
+
         for (uint32_t& iTriangle = numTexelsPerMicroTriangle.numTrianglesScanned;
              iTriangle < numTriangles && m_numTrianglesToCalculateForNumTexelsPerMicroTriangle > 0;
              iTriangle++, m_numTrianglesToCalculateForNumTexelsPerMicroTriangle--) {
           Vector2 texcoords[3];
           getTriangleTexcoords(iTriangle, texcoords);
+          if (numTexelsPerMicroTriangle.shareScan) {
+            TriangleKey key;
+            getTriangleKey(iTriangle, key);
+            const uint32_t newSlot = static_cast<uint32_t>(numTexelsPerMicroTriangle.slotTriangle.size());
+            const auto slotIter = numTexelsPerMicroTriangle.slotByKey.emplace(XXH3_64bits(&key, sizeof(key)), newSlot);
+            uint32_t slot = slotIter.first->second;
+            if (!slotIter.second) {
+              // Equal hashes are not yet equal triangles.
+              TriangleKey first;
+              getTriangleKey(numTexelsPerMicroTriangle.slotTriangle[slot], first);
+              if (std::memcmp(&first, &key, sizeof(key)) != 0) {
+                slot = newSlot;
+              }
+            }
+            if (slot == newSlot) {
+              numTexelsPerMicroTriangle.slotTriangle.push_back(iTriangle);
+            }
+            numTexelsPerMicroTriangle.slotOfTriangle[iTriangle] = slot;
+          }
           const Vector2 e01 = (texcoords[1] - texcoords[0]) * opacityTextureResolution;
           const Vector2 e02 = (texcoords[2] - texcoords[0]) * opacityTextureResolution;
           const Vector2 e12 = (texcoords[2] - texcoords[1]) * opacityTextureResolution;
@@ -1119,6 +1180,20 @@ namespace dxvk {
         if (numTexelsPerMicroTriangle.numTrianglesScanned != numTriangles) {
           return;
         }
+
+        // rtx.opacityMicromap.building.shareEqualTriangles: the mesh shares when a quarter of its triangles or more
+        // repeat others. The array, the micromap and the budget below are then those of the distinct triangles.
+        if (numTexelsPerMicroTriangle.shareScan) {
+          const size_t numSlots = numTexelsPerMicroTriangle.slotTriangle.size();
+          if (numSlots == 0 || numSlots * 4 > size_t(numTriangles) * 3) {
+            std::vector<uint32_t>().swap(numTexelsPerMicroTriangle.slotOfTriangle);
+            std::vector<uint32_t>().swap(numTexelsPerMicroTriangle.slotTriangle);
+          }
+          std::unordered_map<XXH64_hash_t, uint32_t>().swap(numTexelsPerMicroTriangle.slotByKey);
+          numTexelsPerMicroTriangle.shareScan = false;
+        }
+        const uint32_t numBakedTriangles = numTexelsPerMicroTriangle.slotTriangle.empty()
+          ? numTriangles : static_cast<uint32_t>(numTexelsPerMicroTriangle.slotTriangle.size());
 
         // The lowest level whose finer bins hold at most 5% of the texel area. Level 3 is the floor: below it a
         // 2-state triangle has fewer than 4 bytes, which the compact and software paths need.
@@ -1152,14 +1227,15 @@ namespace dxvk {
             budget = static_cast<VkDeviceSize>(OpacityMicromapOptions::Cache::maxBudgetSizeMB()) * 1024 * 1024;
           }
           const VkDeviceSize itemCap = static_cast<VkDeviceSize>(static_cast<double>(budget) * budgetFraction);
-          const VkIndexType indexType = numTriangles <= UINT16_MAX ? VK_INDEX_TYPE_UINT16 : VK_INDEX_TYPE_UINT32;
+          const VkIndexType indexType = numBakedTriangles <= UINT16_MAX ? VK_INDEX_TYPE_UINT16 : VK_INDEX_TYPE_UINT32;
+          const VkDeviceSize sharedIndexBytes = numBakedTriangles != numTriangles ? VkDeviceSize(numTriangles) * sizeof(uint32_t) : 0;
           const uint32_t levelBefore = level;
           while (level > kMinAdaptiveSubdivisionLevel) {
             VkDeviceSize arrayBytes = 0;
             VkDeviceSize blasBytes = 0;
-            calculateRequiredVRamSize(numTriangles, static_cast<uint16_t>(level), VK_OPACITY_MICROMAP_FORMAT_4_STATE_EXT, indexType,
+            calculateRequiredVRamSize(numBakedTriangles, static_cast<uint16_t>(level), VK_OPACITY_MICROMAP_FORMAT_4_STATE_EXT, indexType,
                                       arrayBytes, blasBytes);
-            if (arrayBytes + blasBytes <= itemCap) {
+            if (arrayBytes + blasBytes + sharedIndexBytes <= itemCap) {
               break;
             }
             level--;
@@ -2650,17 +2726,43 @@ namespace dxvk {
       ommCacheItem.subdivisionLevel = std::min(ommCacheItem.subdivisionLevel, texelDataSubdivisionLevel);
     }
 
-    const uint32_t numTriangles = sourceData.numTriangles;
+    omm_validation_assert((usesSplitBillboardOpacityMicromap(instance) || sourceData.numTriangles == instance.getBlas()->input.getGeometryData().calculatePrimitiveCount()) &&
+                          instance.getBlas()->input.getGeometryData().calculatePrimitiveCount() ==
+                          instance.getBlas()->modifiedGeometryData.calculatePrimitiveCount() &&
+                          "Number of triangles must match and be consistent");
+
+    // rtx.opacityMicromap.building.shareEqualTriangles: with the array's memory the item takes the mesh's distinct
+    // triangles (the level scan found them and chose the level for them), and keeps them until its micromap is built.
+    const NumTexelsPerMicroTriangleCalculationData* sharedTexelData = nullptr;
+    if (ommCacheItem.getDeviceSize() == 0) {
+      ommCacheItem.numSharedSlots = 0;
+      std::vector<uint32_t>().swap(ommCacheItem.sharedSlotOfTriangle);
+      std::vector<uint16_t>().swap(ommCacheItem.sharedSlotTexels);
+      ommCacheItem.sharedSlotTriangleBuffer = nullptr;
+
+      const NumTexelsPerMicroTriangleCalculationData* texelData = nullptr;
+      if (useStagingNumTexelsPerMicroTriangleObject(instance)) {
+        const auto texelDataIter = m_numTexelsPerMicroTriangleStaging.find(&instance);
+        texelData = texelDataIter != m_numTexelsPerMicroTriangleStaging.end() ? &texelDataIter->second : nullptr;
+      } else {
+        const auto texelDataIter = m_numTexelsPerMicroTriangle.find(getOpacityMicromapHash(instance));
+        texelData = texelDataIter != m_numTexelsPerMicroTriangle.end() ? &texelDataIter->second : nullptr;
+      }
+      if (texelData != nullptr && texelData->isSharing() && !m_software && RtxOptions::compactMicromaps() &&
+          sourceData.triangleOffset == 0 && texelData->slotOfTriangle.size() == sourceData.numTriangles &&
+          texelData->result.size() == sourceData.numTriangles && texelData->subdivisionLevel == ommCacheItem.subdivisionLevel) {
+        sharedTexelData = texelData;
+      }
+    }
+
+    // The triangles the array holds: the mesh's, or its distinct ones.
+    const uint32_t numTriangles = sharedTexelData != nullptr
+      ? static_cast<uint32_t>(sharedTexelData->slotTriangle.size()) : ommCacheItem.numBakedTriangles(sourceData.numTriangles);
     const uint32_t numMicroTrianglesPerTriangle = calculateNumMicroTriangles(ommCacheItem.subdivisionLevel);
     const uint32_t numMicroTriangles = numTriangles * numMicroTrianglesPerTriangle;
     const uint8_t numOpacityMicromapBitsPerMicroTriangle = ommCacheItem.ommFormat == VK_OPACITY_MICROMAP_FORMAT_2_STATE_EXT ? 1 : 2;
     const uint32_t opacityMicromapPerTriangleBufferSize = dxvk::util::ceilDivide(numMicroTrianglesPerTriangle * numOpacityMicromapBitsPerMicroTriangle, 8);
     const uint32_t opacityMicromapBufferSize = numTriangles * opacityMicromapPerTriangleBufferSize;
-
-    omm_validation_assert((usesSplitBillboardOpacityMicromap(instance) || numTriangles == instance.getBlas()->input.getGeometryData().calculatePrimitiveCount()) &&
-                          instance.getBlas()->input.getGeometryData().calculatePrimitiveCount() ==
-                          instance.getBlas()->modifiedGeometryData.calculatePrimitiveCount() &&
-                          "Number of triangles must match and be consistent");
 
     // Preallocate all the device memory needed to build the OMM item
     if (ommCacheItem.getDeviceSize() == 0)
@@ -2671,12 +2773,39 @@ namespace dxvk {
       const VkIndexType triangleIndexType = numTriangles <= UINT16_MAX ? VK_INDEX_TYPE_UINT16 : VK_INDEX_TYPE_UINT32;
       calculateRequiredVRamSize(numTriangles, ommCacheItem.subdivisionLevel, ommCacheItem.ommFormat, triangleIndexType,
                                 arrayBufferDeviceSize, blasOmmBuffersDeviceSize);
+      if (sharedTexelData != nullptr) {
+        // the index of every mesh triangle
+        blasOmmBuffersDeviceSize += VkDeviceSize(sourceData.numTriangles) * sizeof(uint32_t);
+      }
 
       VkDeviceSize requiredDeviceSize = arrayBufferDeviceSize + blasOmmBuffersDeviceSize;
 
       if (!m_memoryManager.allocate(requiredDeviceSize)) {
         m_amountOfMemoryMissing += requiredDeviceSize;
         return OmmResult::OutOfMemory;
+      }
+
+      if (sharedTexelData != nullptr) {
+        // The table the bake shader reads: per slot, the mesh triangle to take the texcoords from.
+        DxvkBufferCreateInfo slotBufferInfo;
+        slotBufferInfo.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+        slotBufferInfo.stages = VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT;
+        slotBufferInfo.access = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
+        slotBufferInfo.size = VkDeviceSize(numTriangles) * sizeof(uint32_t);
+        Rc<DxvkBuffer> slotBuffer = m_device->createBuffer(slotBufferInfo, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
+                                                           DxvkMemoryStats::Category::RTXOpacityMicromap, "OMM shared triangle table");
+        if (slotBuffer == nullptr) {
+          m_memoryManager.release(requiredDeviceSize);
+          return OmmResult::OutOfMemory;
+        }
+        ctx->writeToBuffer(slotBuffer, 0, slotBufferInfo.size, sharedTexelData->slotTriangle.data());
+        ommCacheItem.numSharedSlots = numTriangles;
+        ommCacheItem.sharedSlotOfTriangle = sharedTexelData->slotOfTriangle;
+        ommCacheItem.sharedSlotTexels.resize(numTriangles);
+        for (uint32_t slot = 0; slot < numTriangles; slot++) {
+          ommCacheItem.sharedSlotTexels[slot] = sharedTexelData->result[sharedTexelData->slotTriangle[slot]];
+        }
+        ommCacheItem.sharedSlotTriangleBuffer = slotBuffer;
       }
 
       ommCacheItem.arrayBufferDeviceSize = arrayBufferDeviceSize;
@@ -2745,7 +2874,9 @@ namespace dxvk {
 
     // Generate OMM array
     {
-      RtxGeometryUtils::BakeOpacityMicromapDesc desc(*numTexelsPerMicroTriangle);
+      // rtx.opacityMicromap.building.shareEqualTriangles: the array's triangles are the item's slots.
+      RtxGeometryUtils::BakeOpacityMicromapDesc desc(ommCacheItem.numSharedSlots != 0 ? ommCacheItem.sharedSlotTexels : *numTexelsPerMicroTriangle);
+      desc.triangleTable = ommCacheItem.sharedSlotTriangleBuffer;
       desc.subdivisionLevel = ommCacheItem.subdivisionLevel;
       desc.numMicroTrianglesPerTriangle = calculateNumMicroTriangles(ommCacheItem.subdivisionLevel);
       desc.ommFormat = ommCacheItem.ommFormat;
@@ -2816,7 +2947,14 @@ namespace dxvk {
     CachedSourceData& sourceData = sourceDataIter->second;
 
     const uint32_t numMicroTrianglesPerTriangle = calculateNumMicroTriangles(ommCacheItem.subdivisionLevel);
-    const uint32_t numTriangles = sourceData.numTriangles;
+    // rtx.opacityMicromap.building.shareEqualTriangles: the array holds the mesh's distinct triangles (slots), and
+    // the index buffer names the slot of every mesh triangle.
+    const bool sharedSlots = ommCacheItem.numSharedSlots != 0;
+    const uint32_t numMeshTriangles = sourceData.numTriangles;
+    const uint32_t numTriangles = ommCacheItem.numBakedTriangles(numMeshTriangles);
+    if (sharedSlots && ommCacheItem.sharedSlotOfTriangle.size() != numMeshTriangles) {
+      return OmmResult::Failure;
+    }
     const uint32_t numMicroTriangles = numTriangles * numMicroTrianglesPerTriangle;
 
     // OMM builds are at per OMM item granularity
@@ -2830,7 +2968,8 @@ namespace dxvk {
     uint32_t numMixed = numTriangles;
     if (compact) {
       const uint32_t frame = m_device->getCurrentFrameId();
-      if (frame < ommCacheItem.compactDispatchFrame + 1 || ommCacheItem.compactCounter->isInUse()) {
+      if (frame < ommCacheItem.compactDispatchFrame + 1 || ommCacheItem.compactCounter->isInUse() ||
+          (sharedSlots && (ommCacheItem.compactIndexBuffer == nullptr || ommCacheItem.compactIndexBuffer->isInUse()))) {
         return OmmResult::DependenciesUnavailable;
       }
       numMixed = std::min(*static_cast<const uint32_t*>(ommCacheItem.compactCounter->mapPtr(0)), numTriangles);
@@ -2840,9 +2979,36 @@ namespace dxvk {
     const uint8_t numOpacityMicromapBitsPerMicroTriangle = ommCacheItem.ommFormat == VK_OPACITY_MICROMAP_FORMAT_2_STATE_EXT ? 1 : 2;
     const uint32_t opacityMicromapPerTriangleBufferSize = dxvk::util::ceilDivide(numMicroTrianglesPerTriangle * numOpacityMicromapBitsPerMicroTriangle, 8);
     const uint32_t opacityMicromapBufferSize = numTriangles * opacityMicromapPerTriangleBufferSize;
-    const VkIndexType triangleIndexType = (compact || numTriangles > UINT16_MAX) ? VK_INDEX_TYPE_UINT32 : VK_INDEX_TYPE_UINT16;
+    const VkIndexType triangleIndexType = (compact || sharedSlots || numTriangles > UINT16_MAX) ? VK_INDEX_TYPE_UINT32 : VK_INDEX_TYPE_UINT16;
     const uint32_t numBytesPerIndexElement = triangleIndexType == VK_INDEX_TYPE_UINT16 ? 2 : 4;
     ommCacheItem.blasOmmBuffers = new DxvkOpacityMicromap(*m_device);
+
+    // rtx.opacityMicromap.building.shareEqualTriangles: the index of every mesh triangle, from the index of its slot
+    // (slotIndices, or the slot itself without them).
+    const auto writeMeshTriangleIndices = [&](const uint32_t* slotIndices) -> bool {
+      std::vector<uint32_t> meshIndices(numMeshTriangles);
+      for (uint32_t i = 0; i < numMeshTriangles; i++) {
+        const uint32_t slot = ommCacheItem.sharedSlotOfTriangle[i];
+        if (slot >= numTriangles) {
+          return false;
+        }
+        meshIndices[i] = slotIndices != nullptr ? slotIndices[slot] : slot;
+      }
+      DxvkBufferCreateInfo indexBufferInfo;
+      indexBufferInfo.usage = VK_BUFFER_USAGE_MICROMAP_BUILD_INPUT_READ_ONLY_BIT_EXT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT |
+        VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR;
+      indexBufferInfo.access = VK_ACCESS_TRANSFER_WRITE_BIT;
+      indexBufferInfo.requiredAlignmentOverride = 256;
+      indexBufferInfo.size = VkDeviceSize(numMeshTriangles) * sizeof(uint32_t);
+      Rc<DxvkBuffer> indexBuffer = m_device->createBuffer(indexBufferInfo, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
+                                                          DxvkMemoryStats::Category::RTXOpacityMicromap, "OMM shared triangle index buffer");
+      if (indexBuffer == nullptr) {
+        return false;
+      }
+      ctx->writeToBuffer(indexBuffer, 0, indexBufferInfo.size, meshIndices.data());
+      ommCacheItem.blasOmmBuffers->opacityMicromapTriangleIndexBuffer = indexBuffer;
+      return true;
+    };
 
     // Micromap forward definitions
     Rc<DxvkBuffer> triangleArrayBuffer;     // VkMicromapTriangleEXT per triangle
@@ -2863,7 +3029,16 @@ namespace dxvk {
     // Initialize micromap triangle index buffers
     if (compact) {
       triangleArrayBuffer = ommCacheItem.compactTriangleArray;
-      ommCacheItem.blasOmmBuffers->opacityMicromapTriangleIndexBuffer = ommCacheItem.compactIndexBuffer;
+      if (sharedSlots) {
+        // The compact pass wrote the slots' indices to host memory; the counter read above says it has finished.
+        if (!writeMeshTriangleIndices(static_cast<const uint32_t*>(ommCacheItem.compactIndexBuffer->mapPtr(0)))) {
+          ONCE(Logger::warn("[RTX Opacity Micromap] Failed to write the index buffer of a micromap of shared triangles."));
+          return OmmResult::Failure;
+        }
+        ctx->getCommandList()->trackResource<DxvkAccess::Read>(ommCacheItem.compactIndexBuffer);
+      } else {
+        ommCacheItem.blasOmmBuffers->opacityMicromapTriangleIndexBuffer = ommCacheItem.compactIndexBuffer;
+      }
       if (numMixed == 0) {
         // Every triangle has a special index: the micromap still needs one triangle.
         VkMicromapTriangleEXT one {};
@@ -2893,6 +3068,12 @@ namespace dxvk {
 
       if (result != OmmResult::Success)
         return result;
+
+      // Every slot has a micromap: a mesh triangle's index is its slot.
+      if (sharedSlots && !writeMeshTriangleIndices(nullptr)) {
+        ONCE(Logger::warn("[RTX Opacity Micromap] Failed to write the index buffer of a micromap of shared triangles."));
+        return OmmResult::Failure;
+      }
     }
 
     // Create micromap
@@ -2978,7 +3159,7 @@ namespace dxvk {
       VkDeviceSize unusedArray, compactBlasSize;
       calculateRequiredVRamSize(numMicromapTriangles, ommCacheItem.subdivisionLevel, ommCacheItem.ommFormat, VK_INDEX_TYPE_UINT32,
                                 unusedArray, compactBlasSize);
-      compactBlasSize += VkDeviceSize(numTriangles - std::min(numTriangles, numMicromapTriangles)) * sizeof(uint32_t); // index per triangle
+      compactBlasSize += VkDeviceSize(numMeshTriangles - std::min(numMeshTriangles, numMicromapTriangles)) * sizeof(uint32_t); // index per triangle
       m_compactStats.micromaps++;
       m_compactStats.micromapsPerLevel[std::min<uint32_t>(ommCacheItem.subdivisionLevel, 12)]++;
       m_compactStats.triangles += numTriangles;
@@ -2993,6 +3174,16 @@ namespace dxvk {
       ommCacheItem.compactTriangleArray = nullptr; // kept alive by the command list until the build ran
       ommCacheItem.compactIndexBuffer = nullptr;   // now held by blasOmmBuffers
       ommCacheItem.compactCounter = nullptr;
+    }
+
+    // rtx.opacityMicromap.building.shareEqualTriangles: the slots are in the index buffer now.
+    if (sharedSlots) {
+      m_compactStats.sharedMicromaps++;
+      m_compactStats.sharedTriangles += numMeshTriangles;
+      m_compactStats.sharedSlots += numTriangles;
+      std::vector<uint32_t>().swap(ommCacheItem.sharedSlotOfTriangle);
+      std::vector<uint16_t>().swap(ommCacheItem.sharedSlotTexels);
+      ommCacheItem.sharedSlotTriangleBuffer = nullptr;
     }
 
     // Track the lifetime of all the build buffers needed for BLAS, including non-ref counted .opacityMicromap
@@ -3080,7 +3271,7 @@ namespace dxvk {
           if (RtxOptions::compactMicromaps() || m_software) {
             const uint32_t bitsPerMicroTriangle = ommCacheItem.ommFormat == VK_OPACITY_MICROMAP_FORMAT_2_STATE_EXT ? 1 : 2;
             const uint32_t bytesPerTriangle = dxvk::util::ceilDivide(calculateNumMicroTriangles(ommCacheItem.subdivisionLevel) * bitsPerMicroTriangle, 8);
-            dispatchCompact(ctx, ommCacheItem, sourceData.numTriangles, bytesPerTriangle);
+            dispatchCompact(ctx, ommCacheItem, ommCacheItem.numBakedTriangles(sourceData.numTriangles), bytesPerTriangle);
           }
 
           // Unlink the referenced RtInstance
@@ -3283,7 +3474,9 @@ namespace dxvk {
         double(c.budgetBytesReleased) / (1024.0 * 1024.0), " MiB, budget available ",
         double(m_memoryManager.getAvailable()) / (1024.0 * 1024.0), " of ", double(m_memoryManager.getBudget()) / (1024.0 * 1024.0), " MiB",
         " | micromaps per subdivision level ", levels, " (adaptive ", OpacityMicromapOptions::Building::adaptiveSubdivision() ? 1 : 0,
-        ", budget-capped ", c.budgetCappedMicromaps, " meshes by ", c.budgetCappedLevels, " levels)"));
+        ", budget-capped ", c.budgetCappedMicromaps, " meshes by ", c.budgetCappedLevels, " levels)",
+        " | shared triangles (", OpacityMicromapOptions::Building::shareEqualTriangles() ? 1 : 0, "): ", c.sharedMicromaps, " micromaps, ",
+        c.sharedTriangles, " mesh triangles baked as ", c.sharedSlots));
     }
 
     // Clear caches if we need to rebuild OMMs
@@ -3559,8 +3752,19 @@ namespace dxvk {
     info.access = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
     info.requiredAlignmentOverride = 256;
     info.size = VkDeviceSize(numTriangles) * sizeof(uint32_t);
-    Rc<DxvkBuffer> indexBuffer = m_device->createBuffer(info, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
-                                                        DxvkMemoryStats::Category::RTXOpacityMicromap, "OMM compact index buffer");
+    // rtx.opacityMicromap.building.shareEqualTriangles: the indices are those of the slots; the build reads them back
+    // and writes the index of every mesh triangle (buildOpacityMicromap).
+    const bool sharedSlots = ommCacheItem.numSharedSlots != 0;
+    if (sharedSlots) {
+      info.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
+    }
+    Rc<DxvkBuffer> indexBuffer = m_device->createBuffer(info,
+      sharedSlots ? VkMemoryPropertyFlags(VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT)
+                  : VkMemoryPropertyFlags(VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT),
+      DxvkMemoryStats::Category::RTXOpacityMicromap, "OMM compact index buffer");
+    if (sharedSlots && indexBuffer != nullptr && indexBuffer->mapPtr(0) == nullptr) {
+      indexBuffer = nullptr;
+    }
     info.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT |
       VK_BUFFER_USAGE_MICROMAP_BUILD_INPUT_READ_ONLY_BIT_EXT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
     if (m_software) {

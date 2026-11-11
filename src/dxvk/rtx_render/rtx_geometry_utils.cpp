@@ -123,6 +123,7 @@ namespace dxvk {
         STRUCTURED_BUFFER(BINDING_BAKE_OPACITY_MICROMAP_BINDING_SURFACE_DATA_INPUT)
         CONSTANT_BUFFER(BINDING_BAKE_OPACITY_MICROMAP_CONSTANTS)
         RW_STRUCTURED_BUFFER(BINDING_BAKE_OPACITY_MICROMAP_ARRAY_OUTPUT)
+        STRUCTURED_BUFFER(BINDING_BAKE_OPACITY_MICROMAP_TRIANGLE_TABLE_INPUT)
       END_PARAMETER()
     };
 
@@ -703,6 +704,13 @@ namespace dxvk {
       logOmmBakeReject("no output buffer", instance, &opacityTexture);
       return false;
     }
+    // rtx.opacityMicromap.building.shareEqualTriangles: the table names a mesh triangle per baked triangle.
+    if (desc.triangleTable != nullptr &&
+        (desc.triangleOffset != 0 || desc.triangleTable->info().size < VkDeviceSize(desc.numTriangles) * sizeof(uint32_t))) {
+      logOmmBakeReject(str::format("shared triangle table of ", desc.triangleTable->info().size, " bytes for ", desc.numTriangles,
+                                   " triangles at offset ", desc.triangleOffset), instance, &opacityTexture);
+      return false;
+    }
     // NV-DXVK end
 
     // Fill out the arguments
@@ -734,6 +742,7 @@ namespace dxvk {
     }
     // NV-DXVK end
     args.triangleOffset = desc.triangleOffset;
+    args.useTriangleTable = desc.triangleTable != nullptr ? 1 : 0;
 
     // Init samplers
     Rc<DxvkSampler> opacitySampler;
@@ -774,6 +783,15 @@ namespace dxvk {
                             DxvkBufferSlice(device()->getCommon()->getSceneManager().getSurfaceBuffer()));
     ctx->bindResourceBuffer(BINDING_BAKE_OPACITY_MICROMAP_ARRAY_OUTPUT,
                             DxvkBufferSlice(opacityMicromapBuffer, 0, opacityMicromapBuffer->info().size));
+    // rtx.opacityMicromap.building.shareEqualTriangles. Without a table the shader does not read the binding; the
+    // texcoords stand in for it.
+    if (desc.triangleTable != nullptr) {
+      ctx->bindResourceBuffer(BINDING_BAKE_OPACITY_MICROMAP_TRIANGLE_TABLE_INPUT,
+                              DxvkBufferSlice(desc.triangleTable, 0, desc.triangleTable->info().size));
+      ctx->getCommandList()->trackResource<DxvkAccess::Read>(desc.triangleTable);
+    } else {
+      ctx->bindResourceBuffer(BINDING_BAKE_OPACITY_MICROMAP_TRIANGLE_TABLE_INPUT, geo.texcoordBuffer);
+    }
 
     ctx->bindShader(VK_SHADER_STAGE_COMPUTE_BIT, BakeOpacityMicromapShader::getShader());
 

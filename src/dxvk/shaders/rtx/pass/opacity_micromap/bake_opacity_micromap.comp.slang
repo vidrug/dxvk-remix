@@ -55,6 +55,10 @@ StructuredBuffer<Surface> Surfaces;
 layout(binding = BINDING_BAKE_OPACITY_MICROMAP_ARRAY_OUTPUT)
 RWStructuredBuffer<uint8_t> OpacityMicromapArray;
 
+// rtx.opacityMicromap.building.shareEqualTriangles
+layout(binding = BINDING_BAKE_OPACITY_MICROMAP_TRIANGLE_TABLE_INPUT)
+StructuredBuffer<uint> TriangleTable;
+
 void loadVertexData(uint triIdx, Surface surface, out float2 vertexTexcoords[3], out float16_t vertexOpacities[3]) 
 {
   for (uint i = 0; i < 3; i++) 
@@ -394,7 +398,14 @@ void main(uint globalId: SV_DispatchThreadID, uint groupId : SV_GroupID, uint th
   
   float2 vertexTexcoords[3];
   float16_t vertexOpacities[3];
-  loadVertexData(triIdx, cb.surface, vertexTexcoords, vertexOpacities);
+  // rtx.opacityMicromap.building.shareEqualTriangles: the array holds the mesh's distinct triangles, and the table
+  // names the mesh triangle each of them is read from.
+  uint meshTriIdx = triIdx;
+  if (cb.useTriangleTable != 0)
+  {
+    meshTriIdx = TriangleTable[min(triIdx, cb.numTriangles - 1)];
+  }
+  loadVertexData(meshTriIdx, cb.surface, vertexTexcoords, vertexOpacities);
   
   uint8_t compactResult = 0;
   for (uint i=0; i<numTrisPerThread; i++)
