@@ -1483,6 +1483,19 @@ namespace dxvk {
     }
     m_settle.resize(kept);
 
+    // An instance usually becomes a micromap's bake source several frames after it settled (the request filter
+    // waits for a number of requests), when it is in neither list any more. Its texel table is only calculated
+    // from instance-update events, so without these stamps the bake found no table, unlinked the instance, and the
+    // micromap stayed unfinished for every instance of the hash.
+    if (omm != nullptr) {
+      for (const RtInstance* source : omm->getSourcesAwaitingTexels()) {
+        RtInstance* instance = const_cast<RtInstance*>(source);
+        if (instance->getSceneOwnedHandle() != 0 && !instance->isMarkedForGC() && needsOmmStamps(*instance)) {
+          m_ommPending.push_back(instance);
+        }
+      }
+    }
+
     kept = 0;
     for (size_t i = 0; i < m_ommPending.size(); ++i) {
       RtInstance* instance = m_ommPending[i];

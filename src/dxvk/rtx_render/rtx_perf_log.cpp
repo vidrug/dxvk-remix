@@ -1119,8 +1119,14 @@ namespace dxvk {
         " lostRerequests=", churn.lostRerequests, " evictions=", churn.evictions,
         " (younger than minUsageFrameAge ", churn.evictedYoungerThan900, ")",
         " mergedInUseRefreshes=", churn.mergedTouches,
+        // rtx.opacityMicromap.keepSharedBakes: instance destructions that left another instance's bake alone,
+        // unfinished micromaps that lost their source instance, and those a live instance took over.
+        " sharedBakesKept=", churn.sharedBakesKept, " orphanedBakes=", churn.orphanedBakes,
+        " adoptedBakes=", churn.adoptedBakes,
         " | rebakeOnTextureChange=", OpacityMicromapOptions::rebakeOnTextureChange() ? 1 : 0,
         " rerequestLost=", OpacityMicromapOptions::rerequestLostMicromaps() ? 1 : 0,
+        " keepSharedBakes=", OpacityMicromapOptions::keepSharedBakes() ? 1 : 0,
+        " adoptEveryFrames=", OpacityMicromapOptions::adoptOrphanedBakesEveryFrames(),
         " keepMergedInUse=", OpacityMicromapOptions::Cache::keepMergedBlasMicromapsInUse() ? 1 : 0,
         " lastInteractionSkipsCutouts=", RtxOptions::resolveFinalInteractionSkipsNonOpaque() ? 1 : 0,
         // Record the foliage-ray A/B state next to the other cutout knobs.

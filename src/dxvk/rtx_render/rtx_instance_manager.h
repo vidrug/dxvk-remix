@@ -195,6 +195,9 @@ uint32_t getFirstBillboardIndex() const { return m_firstBillboard; }
   bool isViewModelReference() const;
   bool isViewModelVirtual() const;
   bool isSubsurface() const { return m_isSubsurface; }
+  // A thin opaque surface that lets light through (a subsurface measurement distance, no diffusion profile): a
+  // shadow ray is attenuated by it instead of ending on it, which only the evaluation of its material can do.
+  bool isThinSubsurface() const { return m_isThinSubsurface; }
   bool isCreatedByRenderer() const { return m_isCreatedByRenderer; }
   bool isPlayerModelInstance() const { return m_isPlayerModel; }
 
@@ -304,6 +307,7 @@ private:
   bool m_isObjectToWorldMirrored = false;
   bool m_isCreatedByRenderer = false;
   bool m_isSubsurface = false;
+  bool m_isThinSubsurface = false;
   bool m_blasDirty = true;  // Needs reprocessing in mergeInstancesIntoBlas; starts dirty for new instances
   bool m_billboardGeometryDirty = true;  // Needs initial geometry info generation for billboard-derived layout
   BlasEntry* m_linkedBlas = nullptr;

@@ -217,6 +217,7 @@ namespace dxvk {
     m_isUnordered = src.m_isUnordered;
     m_isObjectToWorldMirrored = src.m_isObjectToWorldMirrored;
     m_isSubsurface = src.m_isSubsurface;
+    m_isThinSubsurface = src.m_isThinSubsurface;
     m_linkedBlas = src.m_linkedBlas;
     m_materialHash = src.m_materialHash;
     m_materialDataHash = src.m_materialDataHash;
@@ -1078,6 +1079,9 @@ namespace dxvk {
           }
 
           currentInstance.m_isSubsurface = materialData->getOpaqueMaterialData().getSubsurfaceDiffusionProfile();
+          // As isThinOpaqueSubsurfaceMaterial has it for a surface interaction, from the material's constant.
+          currentInstance.m_isThinSubsurface = !currentInstance.m_isSubsurface &&
+            materialData->getOpaqueMaterialData().getSubsurfaceMeasurementDistance() > 0.f;
         }
       }
 

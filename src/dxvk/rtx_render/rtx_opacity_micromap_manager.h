@@ -63,6 +63,19 @@ namespace dxvk {
                "When an instance finds that its registered opacity micromap is no longer cached (evicted, dropped for a "
                "rebake, or destroyed with another instance that shared it), registers it again. Without this, such an "
                "instance traces without a micromap until it is recreated.");
+    RTX_OPTION("rtx.opacityMicromap", bool, keepSharedBakes, true,
+               "Instances of one mesh and texture share one opacity micromap, baked from one of them. With this on, "
+               "destroying an instance leaves an unfinished micromap alone while another live instance is the one it is "
+               "baked from; and when the instance it is baked from goes, the micromap keeps what is baked and waits for "
+               "another instance of the same hash (rtx.opacityMicromap.adoptOrphanedBakesEveryFrames). Without it, the "
+               "destruction of any one instance of a mesh drawn many times (a plant, a fence segment) drops or stops "
+               "the bake for all of them, and the others, already registered, never ask again: they trace without a "
+               "micromap for as long as they live ([SceneStats] zombies). The image does not depend on it.");
+    RTX_OPTION("rtx.opacityMicromap", int, adoptOrphanedBakesEveryFrames, 8,
+               "Every this many frames, an unfinished opacity micromap that has lost the instance it was baked from is "
+               "handed to a live registered instance of the same hash that was updated this frame, and its bake goes on "
+               "from where it stopped. At most 64 per check. 0 turns the check off: such a micromap then waits for a "
+               "new instance of its hash to register.");
 
 
     struct Cache {
@@ -129,6 +142,15 @@ namespace dxvk {
       RTX_OPTION("rtx.opacityMicromap.building", bool, allow2StateOpacityMicromaps, true, "Allows generation of two state Opacity Micromaps.");
       RTX_OPTION("rtx.opacityMicromap.building", bool, force2StateOpacityMicromaps, false, "Forces generation of two state Opacity Micromaps.");
       RTX_OPTION("rtx.opacityMicromap.building", int, subdivisionLevel, 8, "Opacity Micromap subdivision level per triangle. ");
+      RTX_OPTION("rtx.opacityMicromap.building", bool, thinSubsurfaceOpaqueAsUnknown, true,
+                 "Bakes the 4-state micromap of a thin opaque subsurface surface (a translucent leaf: a subsurface "
+                 "measurement distance without a diffusion profile) with no opaque state: texels that would be opaque "
+                 "are stored as unknown, so rays still evaluate the material there, and only fully transparent texels "
+                 "are skipped without it. A shadow ray is attenuated by such a surface instead of ending on it, and an "
+                 "opaque micro-triangle ends the ray before the material is looked at, so with opaque states the shadow "
+                 "through such a leaf turned solid as soon as its micromap was built. Off: the micromap also resolves "
+                 "the opaque texels, which is faster and changes those shadows. Part of the micromap hash: instances "
+                 "registered after a change bake anew.");
       RTX_OPTION("rtx.opacityMicromap.building", bool, adaptiveSubdivision, true,
                  "Picks each mesh's subdivision level from its texel density, up to rtx.opacityMicromap.building.subdivisionLevel.\n"
                  "The level is the lowest one at which micro-triangles are at most one opacity texel across on triangles\n"
@@ -266,7 +288,9 @@ namespace dxvk {
 
     VkOpacityMicromapFormatEXT ommFormat = VK_OPACITY_MICROMAP_FORMAT_4_STATE_EXT;         // 4B
     uint32_t numTriangles = 0;
-    uint32_t pad32[2] = {};
+    // rtx.opacityMicromap.building.thinSubsurfaceOpaqueAsUnknown: baked with no opaque state.
+    uint32_t opaqueAsUnknown = 0;
+    uint32_t pad32 = 0;
   };
 
   // Static validation to detect any changes that require OmmHashData alignment re-check
@@ -281,6 +305,7 @@ namespace dxvk {
     XXH64_hash_t ommSrcHash = kEmptyHash;
     uint32_t numTriangles = UINT32_MAX;
     VkOpacityMicromapFormatEXT ommFormat = VK_OPACITY_MICROMAP_FORMAT_MAX_ENUM_EXT;
+    bool opaqueAsUnknown = false;   // rtx.opacityMicromap.building.thinSubsurfaceOpaqueAsUnknown
 
     OmmRequest(const RtInstance& _instance, const InstanceManager& instanceManager, uint32_t _quadSliceIndex = kInvalidIndex);
     OmmRequest(OmmRequest&&) = default;
@@ -302,6 +327,8 @@ namespace dxvk {
     uint16_t subdivisionLevel = UINT16_MAX;
     uint32_t numTriangles = UINT32_MAX;
     VkOpacityMicromapFormatEXT ommFormat = VK_OPACITY_MICROMAP_FORMAT_2_STATE_EXT;
+    // rtx.opacityMicromap.building.thinSubsurfaceOpaqueAsUnknown, as the request that created the item had it.
+    bool opaqueAsUnknown = false;
     std::list<XXH64_hash_t>::iterator leastRecentlyUsedListIter;
 
     // Iterator to a cache state list for the current cacheState.
@@ -449,6 +476,7 @@ namespace dxvk {
     uint32_t ommRegistrationGeneration = 0;
     uint32_t ommEligibilityGeneration = UINT32_MAX;  // Generation when eligibility was last evaluated
     uint32_t ommRetryAfterFrame = 0;                 // Skip processing until this frame is reached
+    uint32_t ommSourceLinkFrame = 0;                 // Frame the instance last became a micromap's bake source
     bool usesOMM : 1;
     bool needsToCalculateNumTexelsPerMicroTriangle : 1;
     bool ommBuildRequested : 1;
@@ -561,6 +589,13 @@ namespace dxvk {
     // calculation it drives). False means the callback would return without changing anything.
     static bool needsPreserveUpdate(const RtInstance& instance);
     static XXH64_hash_t getOpacityMicromapHash(const RtInstance& instance);
+    // The instances micromaps are being baked from whose texel table is not calculated yet. It is calculated in
+    // onInstanceUpdated, and an instance usually becomes a bake source several frames after it was created (the
+    // request filter), so the owner of an instance that is not drawn every frame has to go on updating it while it
+    // is listed here (RetainedScene::settle). Read on the thread that runs processOmmCandidates.
+    const std::unordered_set<const RtInstance*>& getSourcesAwaitingTexels() const {
+      return m_sourcesAwaitingTexels;
+    }
 
     // rtx.opacityMicromap.bindSharedBlas. Whether one micromap is valid for every instance
     // of a per-geometry BLAS they share. The micromap is baked into the BLAS, so it is applied to all of them:
@@ -668,6 +703,9 @@ namespace dxvk {
       uint32_t evictions = 0;             // LRU evictions
       uint32_t evictedYoungerThan900 = 0; // evictions forced by a budget decrease
       uint32_t mergedTouches = 0;         // keepMergedBlasMicromapsInUse refreshes
+      uint32_t sharedBakesKept = 0;       // keepSharedBakes: an instance went, another one is the bake source
+      uint32_t orphanedBakes = 0;         // keepSharedBakes: the bake source went, the micromap waits for another
+      uint32_t adoptedBakes = 0;          // adoptOrphanedBakesEveryFrames, or a new instance of the hash registered
     };
     ChurnStats takeChurnStats() {
       const ChurnStats s = m_churn;
@@ -973,6 +1011,17 @@ namespace dxvk {
     void queueSoftwareSlotRelease(OpacityMicromapCacheItem& ommCacheItem);
     // rtx.opacityMicromap.rerequestLostMicromaps for an instance whose registered micromap is no longer in the cache.
     void rerequestLostMicromap(const RtInstance& instance, XXH64_hash_t ommSrcHash);
+    // rtx.opacityMicromap.keepSharedBakes: unprocessed or baking cache items with no source data and no place in the
+    // unprocessed list, because the instance they were baked from was destroyed, with the frame that happened in.
+    // An item leaves the map when an instance takes it over (adoptOrphanedBakes, registerOmmRequestInternal) or when
+    // it is destroyed.
+    std::unordered_map<XXH64_hash_t, uint32_t> m_orphanedBakes;
+    // getSourcesAwaitingTexels: from CachedSourceData::setInstance to the end of the calculation or the unlink.
+    std::unordered_set<const RtInstance*> m_sourcesAwaitingTexels;
+    // rtx.opacityMicromap.adoptOrphanedBakesEveryFrames.
+    void adoptOrphanedBakes(const InstanceManager& instanceManager);
+    // Links the request's instance as the source of an orphaned item and puts the item back into the unprocessed list.
+    bool adoptOrphanedBake(OpacityMicromapCacheItem& ommCacheItem, const OmmRequest& ommRequest);
     std::vector<uint32_t> m_softSlotsToRelease;
     // Per instance: the source hash of a fresh request (as a hardware bind builds it), recomputed when the instance is
     // updated outside the preserve path.

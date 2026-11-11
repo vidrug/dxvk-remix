@@ -90,7 +90,8 @@ namespace dxvk {
     , cacheStateListIter(_cacheStateListIter)
     , isUnprocessedCacheStateListIterValid(true)
     , numTriangles(ommRequest.numTriangles)
-    , ommFormat(ommRequest.ommFormat) {
+    , ommFormat(ommRequest.ommFormat)
+    , opaqueAsUnknown(ommRequest.opaqueAsUnknown) {
     useVertexAndTextureOperations = enableVertexAndTextureOperations;
     // Software micromaps have no device limit, which is 0 without the extension.
     // Level 12 = 16M micro-triangles per triangle is the software cap; the store needs whole 32-bit words per triangle
@@ -356,6 +357,11 @@ namespace dxvk {
         hashSourceData.ommFormat = VK_OPACITY_MICROMAP_FORMAT_2_STATE_EXT;
     }
 
+    // rtx.opacityMicromap.building.thinSubsurfaceOpaqueAsUnknown. A 2-state micromap has no unknown state.
+    hashSourceData.opaqueAsUnknown =
+      hashSourceData.ommFormat == VK_OPACITY_MICROMAP_FORMAT_4_STATE_EXT && instance.isThinSubsurface() &&
+      OpacityMicromapOptions::Building::thinSubsurfaceOpaqueAsUnknown() ? 1u : 0u;
+
     if (OpacityMicromapOptions::Cache::hashInstanceIndexOnly()) {
       ommSrcHash = instance.getId();
     }
@@ -367,6 +373,7 @@ namespace dxvk {
 
     numTriangles = hashSourceData.numTriangles;
     ommFormat = hashSourceData.ommFormat;
+    opaqueAsUnknown = hashSourceData.opaqueAsUnknown != 0;
   }
 
   OpacityMicromapManager::CachedSourceData::~CachedSourceData() {
@@ -403,6 +410,8 @@ namespace dxvk {
       //   but that is OK as the data will not be calculated twice 
       //   since it's checked for being available first then
       newOmmInstanceData.needsToCalculateNumTexelsPerMicroTriangle = true;
+      newOmmInstanceData.ommSourceLinkFrame = ommManager.m_device->getCurrentFrameId();
+      ommManager.m_sourcesAwaitingTexels.insert(newInstance);
     }
     // instance should always be valid at this point, but let's check on previous instance being actually valid before unlinking it
     else if (instance) {
@@ -432,6 +441,7 @@ namespace dxvk {
     // and it's possible the calculation doesn't complete prior to instance being unlinked 
     // (i.e. due to linked OMM cache items getting destroyed)
     ommInstanceData.needsToCalculateNumTexelsPerMicroTriangle = false;
+    m_sourcesAwaitingTexels.erase(&instance);
 
     // Delete staging numTexelsPerMicroTriangle data associated with the instance
     if (useStagingNumTexelsPerMicroTriangleObject(instance)) {
@@ -464,6 +474,8 @@ namespace dxvk {
     const XXH64_hash_t ommSrcHash = ommCacheItemIter->first;
     OpacityMicromapCacheItem& ommCacheItem = ommCacheItemIter->second;
     const OpacityMicromapCacheState ommCacheState = ommCacheItem.cacheState;
+
+    m_orphanedBakes.erase(ommSrcHash); // rtx.opacityMicromap.keepSharedBakes
 
 #ifdef VALIDATION_MODE
     Logger::warn(str::format("[RTX Opacity Micromap] Destroying ", ommSrcHash, " on thread_id ", std::this_thread::get_id()));
@@ -525,6 +537,26 @@ namespace dxvk {
     getOmmInstanceData(instance).ommBuildRequested = false;
     m_ommCandidates.erase(const_cast<RtInstance*>(&instance));
 
+    // rtx.opacityMicromap.keepSharedBakes. Instances of one hash share one request container and one cache item,
+    // and the item is baked from one of them. The others are registered and never register again, so what this
+    // instance's destruction does to an unfinished item decides whether they ever get a micromap.
+    const bool keepSharedBakes = !forceDestroy && OpacityMicromapOptions::keepSharedBakes();
+    // An unprocessed item is only kept while something can hand it on or drop it later.
+    const bool orphanUnprocessed = keepSharedBakes && OpacityMicromapOptions::adoptOrphanedBakesEveryFrames() > 0;
+
+    // The item leaves the bake queue and loses its source; an instance of the same hash can take it over.
+    auto orphan = [&](XXH64_hash_t ommSrcHash, OpacityMicromapCacheItem& ommCacheItem) {
+      if (ommCacheItem.isUnprocessedCacheStateListIterValid) {
+        m_unprocessedList.erase(ommCacheItem.cacheStateListIter);
+        ommCacheItem.isUnprocessedCacheStateListIterValid = false;
+        deleteCachedSourceData(ommSrcHash, ommCacheItem.cacheState, destroyParentInstanceOmmRequestContainer);
+        if (keepSharedBakes) {
+          m_orphanedBakes.insert({ ommSrcHash, m_device->getCurrentFrameId() });
+          ++m_churn.orphanedBakes;
+        }
+      }
+    };
+
     auto destroyCachedData = [&](XXH64_hash_t ommSrcHash) {
       auto ommCacheIterator = m_ommCache.find(ommSrcHash);
 
@@ -539,16 +571,18 @@ namespace dxvk {
         switch (ommCacheState) {
           // Continue with destruction of unbaked items
         case OpacityMicromapCacheState::eStep0_Unprocessed:
+          // keepSharedBakes: nothing is baked yet, but the other instances of the hash count on this item. It
+          // waits for one of them like a partially baked one, and is dropped if none takes it (adoptOrphanedBakes).
+          if (orphanUnprocessed) {
+            orphan(ommSrcHash, ommCacheItem);
+            return;
+          }
           break;
 
           // If the OMM data has been at least partially baked keep it in the cache
         case OpacityMicromapCacheState::eStep1_Baking:
           // Remove partially baked OMM items from to be baked list until a new instance is linked with it again
-          if (ommCacheItem.isUnprocessedCacheStateListIterValid) {
-            m_unprocessedList.erase(ommCacheItem.cacheStateListIter);
-            ommCacheItem.isUnprocessedCacheStateListIterValid = false;
-            deleteCachedSourceData(ommSrcHash, ommCacheState, destroyParentInstanceOmmRequestContainer);
-          }
+          orphan(ommSrcHash, ommCacheItem);
           return;
         case OpacityMicromapCacheState::eStep2_Baked:
         case OpacityMicromapCacheState::eStep3_Built:
@@ -575,10 +609,25 @@ namespace dxvk {
 
       if (instanceOmmRequestsIter != m_instanceOmmRequests.end()) {
         static_assert(destroyParentInstanceOmmRequestContainer == false);
-        for (auto& ommRequest : instanceOmmRequestsIter->second.ommRequests)
+        // keepSharedBakes: a request another live instance is the bake source of is not this instance's to end, and
+        // the container stays for that instance's own destruction to find.
+        bool containerInUse = false;
+        for (auto& ommRequest : instanceOmmRequestsIter->second.ommRequests) {
+          if (keepSharedBakes) {
+            const auto sourceDataIter = m_cachedSourceData.find(ommRequest.ommSrcHash);
+            const RtInstance* source = sourceDataIter != m_cachedSourceData.end() ? sourceDataIter->second.getInstance() : nullptr;
+            if (source != nullptr && source != &instance) {
+              containerInUse = true;
+              ++m_churn.sharedBakesKept;
+              continue;
+            }
+          }
           destroyCachedData(ommRequest.ommSrcHash);
+        }
 
-        m_instanceOmmRequests.erase(instanceOmmRequestsIter);
+        if (!containerInUse) {
+          m_instanceOmmRequests.erase(instanceOmmRequestsIter);
+        }
       }
     }
   }
@@ -597,6 +646,8 @@ namespace dxvk {
       queueSoftwareSlotRelease(item); // rtx.alphaBake.softwareOmm
     }
     m_ommCache.clear();
+    m_orphanedBakes.clear();
+    m_sourcesAwaitingTexels.clear();
     m_softInstanceHashes.clear();
 
 #ifdef VALIDATION_MODE
@@ -1246,12 +1297,14 @@ namespace dxvk {
     if (numTexelsPerMicroTriangle->status != OmmResult::DependenciesUnavailable) {
       OpacityMicromapInstanceData& ommInstanceData = getOmmInstanceData(instance);
       ommInstanceData.needsToCalculateNumTexelsPerMicroTriangle = false;
+      m_sourcesAwaitingTexels.erase(&instance);
     }
   }
 
   void OpacityMicromapManager::onInstanceDestroyed(const RtInstance& instance) {
     m_softInstanceHashes.erase(&instance); // rtx.alphaBake.softwareOmm: the memory may be reused for another instance
     destroyInstance(instance);
+    m_sourcesAwaitingTexels.erase(&instance); // unlinked above if it was a source; never a dangling entry
   }
 
   bool OpacityMicromapManager::calculateInstanceUsesOpacityMicromap(const RtInstance& instance) {
@@ -1949,6 +2002,9 @@ namespace dxvk {
         m_ommCandidates.insert(inst);
       }
     }
+
+    // After the registrations: a new instance of an orphaned hash has taken it over there.
+    adoptOrphanedBakes(instanceManager);
   }
 
   bool OpacityMicromapManager::registerOmmRequestInternal(RtInstance& instance, const OmmRequest& ommRequest) {
@@ -1978,18 +2034,118 @@ namespace dxvk {
         return false;
       }
 
-      if (ommCacheItem.cacheState == OpacityMicromapCacheState::eStep1_Baking) {
+      // An unprocessed item is in this state only with rtx.opacityMicromap.keepSharedBakes.
+      if (ommCacheItem.cacheState == OpacityMicromapCacheState::eStep0_Unprocessed ||
+          ommCacheItem.cacheState == OpacityMicromapCacheState::eStep1_Baking) {
         auto sourceDataIter = m_cachedSourceData.find(ommSrcHash);
 
         // Source data has been unlinked and removed from unprocessed list, try adding it back to the unprocessed list
         if (sourceDataIter == m_cachedSourceData.end()) {
-          ommCacheItem.isUnprocessedCacheStateListIterValid = insertToUnprocessedList(ommRequest, ommCacheItem.cacheStateListIter);
-          return ommCacheItem.isUnprocessedCacheStateListIterValid;
+          return adoptOrphanedBake(ommCacheItem, ommRequest);
         }
       }
     }
 
     return true;
+  }
+
+  bool OpacityMicromapManager::adoptOrphanedBake(OpacityMicromapCacheItem& ommCacheItem, const OmmRequest& ommRequest) {
+    ommCacheItem.isUnprocessedCacheStateListIterValid = insertToUnprocessedList(ommRequest, ommCacheItem.cacheStateListIter);
+    if (ommCacheItem.isUnprocessedCacheStateListIterValid) {
+      // It has a user again: most recently used, so a trim does not take it while it waits for its turn to bake.
+      ommCacheItem.lastUseFrameIndex = m_tracedFrameIndex;
+      m_leastRecentlyUsedList.splice(m_leastRecentlyUsedList.end(), m_leastRecentlyUsedList, ommCacheItem.leastRecentlyUsedListIter);
+      if (m_orphanedBakes.erase(ommRequest.ommSrcHash) != 0) {
+        ++m_churn.adoptedBakes;
+      }
+    }
+    return ommCacheItem.isUnprocessedCacheStateListIterValid;
+  }
+
+  void OpacityMicromapManager::adoptOrphanedBakes(const InstanceManager& instanceManager) {
+    const int interval = OpacityMicromapOptions::adoptOrphanedBakesEveryFrames();
+    const uint32_t currentFrameIndex = m_device->getCurrentFrameId();
+    if (m_orphanedBakes.empty() || interval <= 0 || currentFrameIndex % uint32_t(interval) != 0) {
+      return;
+    }
+    ScopedCpuProfileZone();
+
+    // An adoption links the instance as a bake source and asks for its texel table.
+    constexpr uint32_t kMaxAdoptionsPerCheck = 64;
+    uint32_t adopted = 0;
+    for (RtInstance* inst : instanceManager.getInstanceTable()) {
+      if (adopted >= kMaxAdoptionsPerCheck || m_orphanedBakes.empty()) {
+        break;
+      }
+      // Updated this frame, or kept by the retained scene, which updates a source until its texel table is there:
+      // the bake unlinks a source whose table is missing and which is no longer updated.
+      if (!inst || inst->isMarkedForGC() || inst->isCreatedByRenderer() || inst->getBlas() == nullptr ||
+          (inst->getFrameLastUpdated() != currentFrameIndex && inst->getSceneOwnedHandle() == 0)) {
+        continue;
+      }
+      const OpacityMicromapInstanceData& ommInstanceData = inst->getOpacityMicromapInstanceData();
+      const XXH64_hash_t ommSrcHash = ommInstanceData.ommSrcHash;
+      if (!ommInstanceData.usesOMM || !ommInstanceData.ommBuildRequested ||
+          ommInstanceData.ommRegistrationGeneration != m_ommGeneration || ommSrcHash == kEmptyHash ||
+          m_orphanedBakes.find(ommSrcHash) == m_orphanedBakes.end()) {
+        continue;
+      }
+      // A split billboard's requests are per quad, under other hashes than the instance's.
+      if (usesSplitBillboardOpacityMicromap(*inst)) {
+        continue;
+      }
+      auto ommCacheIterator = m_ommCache.find(ommSrcHash);
+      if (ommCacheIterator == m_ommCache.end()) {
+        m_orphanedBakes.erase(ommSrcHash);
+        continue;
+      }
+      OpacityMicromapCacheItem& ommCacheItem = ommCacheIterator->second;
+      const bool unfinished = ommCacheItem.cacheState == OpacityMicromapCacheState::eStep0_Unprocessed ||
+                              ommCacheItem.cacheState == OpacityMicromapCacheState::eStep1_Baking;
+      if (!unfinished || ommCacheItem.isUnprocessedCacheStateListIterValid ||
+          m_cachedSourceData.find(ommSrcHash) != m_cachedSourceData.end()) {
+        m_orphanedBakes.erase(ommSrcHash);
+        continue;
+      }
+      const OmmRequest ommRequest(*inst, instanceManager, OmmRequest::kInvalidIndex);
+      if (ommRequest.ommSrcHash != ommSrcHash || !ommCacheItem.isCompatibleWithOmmRequest(ommRequest)) {
+        continue;
+      }
+      // The container this instance's destruction finds its requests in (processOmmCandidates makes it at a
+      // registration); the source's destruction removed the one the hash had.
+      auto instanceOmmRequestsIter = m_instanceOmmRequests.find(ommSrcHash);
+      if (instanceOmmRequestsIter == m_instanceOmmRequests.end()) {
+        instanceOmmRequestsIter = m_instanceOmmRequests.emplace(ommSrcHash, InstanceOmmRequests()).first;
+      }
+      if (instanceOmmRequestsIter->second.ommRequests.empty()) {
+        instanceOmmRequestsIter->second.ommRequests.push_back(ommRequest);
+      }
+      if (adoptOrphanedBake(ommCacheItem, ommRequest)) {
+        ++adopted;
+      } else {
+        instanceOmmRequestsIter = m_instanceOmmRequests.find(ommSrcHash);
+        if (instanceOmmRequestsIter != m_instanceOmmRequests.end() && instanceOmmRequestsIter->second.numActiveRequests == 0) {
+          m_instanceOmmRequests.erase(instanceOmmRequestsIter);
+        }
+      }
+    }
+
+    // An unprocessed item nobody took: nothing is baked, so nothing is lost by dropping it, and an instance of its
+    // hash that appears later registers it anew. A partially baked one stays until the cache evicts it, as before.
+    constexpr uint32_t kUnprocessedOrphanMaxAgeFrames = 600;
+    for (auto orphanIter = m_orphanedBakes.begin(); orphanIter != m_orphanedBakes.end();) {
+      const XXH64_hash_t ommSrcHash = orphanIter->first;
+      const uint32_t orphanedFrame = orphanIter->second;
+      // Advanced first: destroyOmmData erases this hash from the map.
+      ++orphanIter;
+      auto ommCacheIterator = m_ommCache.find(ommSrcHash);
+      if (ommCacheIterator == m_ommCache.end()) {
+        m_orphanedBakes.erase(ommSrcHash);
+      } else if (ommCacheIterator->second.cacheState == OpacityMicromapCacheState::eStep0_Unprocessed &&
+                 currentFrameIndex - orphanedFrame > kUnprocessedOrphanMaxAgeFrames) {
+        destroyOmmData(ommCacheIterator);
+      }
+    }
   }
 
   XXH64_hash_t OpacityMicromapManager::tryBindOpacityMicromap(Rc<DxvkContext> ctx,
@@ -2168,13 +2324,11 @@ namespace dxvk {
     case OpacityMicromapCacheState::eStep1_Baking:
     case OpacityMicromapCacheState::eStep2_Baked:
       // OMM data is not yet ready.
-      // Note (2026-11-05): an item whose source instance was destroyed while it baked keeps its partial array but
-      // leaves the bake queue until an instance with its hash registers again, and a registered instance never
-      // registers again, so such items and every instance sharing their hash stay pending ([SceneStats] zombies).
-      // Re-requesting them here at bind time (rerequestLostMicromap) was tried and made it worse: the host rebuilds
-      // grass batches every few seconds, so the re-linked items restarted over and over, starved the bake budget and
-      // the triangle coverage fell from 78% to 21%. A fix has to re-link the item to a surviving instance of the same
-      // hash at destroyInstance time, without re-registration.
+      // An item whose source instance was destroyed while it was unfinished leaves the bake queue, and a registered
+      // instance never registers again, so every instance sharing its hash would stay pending ([SceneStats] zombies).
+      // rtx.opacityMicromap.keepSharedBakes hands such an item to a live instance of the hash (adoptOrphanedBakes)
+      // and keeps other instances' destruction from ending a bake at all. Re-requesting here at bind time
+      // (rerequestLostMicromap) was tried before and made it worse: the triangle coverage fell from 78% to 21%.
       break;
 
     case OpacityMicromapCacheState::eStep3_Built:
@@ -2460,7 +2614,15 @@ namespace dxvk {
       // Therefore, let's get rid of the instance being linked to OMMs. We can't call destroyInstance() from within baking call stack, 
       // since multiple OMM items linked to it may get purged because of it and baking iterates through a list of OMMs.
       // Instead queue up the instance destruction
-      if (instance.getFrameLastUpdated() != m_device->getCurrentFrameId()) {
+      // rtx.opacityMicromap.keepSharedBakes: an instance that is not drawn every frame gets its first update as a
+      // source the frame after it was linked (RetainedScene::settle), and the calculation is spread over frames.
+      // Unlinked on the spot, as before, no such instance could ever be a source, and it usually is the first of
+      // its hash to register: the request filter passes several frames after the instance was last updated.
+      constexpr uint32_t kSourceTexelGraceFrames = 30;
+      const uint32_t currentFrameIndex = m_device->getCurrentFrameId();
+      const bool inGrace = OpacityMicromapOptions::keepSharedBakes() &&
+        currentFrameIndex - getOmmInstanceData(instance).ommSourceLinkFrame <= kSourceTexelGraceFrames;
+      if (instance.getFrameLastUpdated() != currentFrameIndex && !inGrace) {
         m_instancesToDestroy.push_back(&instance);
       }
       return texelBudgetCheckResult;
@@ -2476,6 +2638,7 @@ namespace dxvk {
         m_numTexelsPerMicroTriangle.erase(getOpacityMicromapHash(instance));
       }
       getOmmInstanceData(instance).needsToCalculateNumTexelsPerMicroTriangle = true;
+      m_sourcesAwaitingTexels.insert(&instance);
       return OmmResult::DependenciesUnavailable;
     }
 
@@ -2600,6 +2763,10 @@ namespace dxvk {
       // Overrides
       if (instance.surface.alphaState.isDecal)
         desc.resolveTransparencyThreshold = std::max(desc.resolveTransparencyThreshold, OpacityMicromapOptions::Building::decalsMinResolveTransparencyThreshold());
+      // rtx.opacityMicromap.building.thinSubsurfaceOpaqueAsUnknown: no opacity reaches the opaque state, so what
+      // is not transparent becomes unknown (unknown opaque where the texels mostly cover) and keeps its any-hit.
+      if (ommCacheItem.opaqueAsUnknown && ommCacheItem.ommFormat == VK_OPACITY_MICROMAP_FORMAT_4_STATE_EXT)
+        desc.resolveOpaquenessThreshold = 2.f;
 
       const auto& samplers = ctx->getCommonObjects()->getSceneManager().getSamplerTable();
             
