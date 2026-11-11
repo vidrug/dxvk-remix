@@ -3601,6 +3601,7 @@ namespace dxvk {
         // requestTrim: the list runs from least to most recently used, so the walk stops at the first recent item.
         if (m_trimMinAgeFrames > 0) {
           uint32_t trimmed = 0;
+          uint32_t keptInProgress = 0;
           const VkDeviceSize usedBefore = m_memoryManager.getUsed();
           for (auto lruOmmSrcHashIter = m_leastRecentlyUsedList.begin(); lruOmmSrcHashIter != m_leastRecentlyUsedList.end();) {
             auto cacheItemIter = m_ommCache.find(*lruOmmSrcHashIter);
@@ -3612,12 +3613,23 @@ namespace dxvk {
               break;
             }
             lruOmmSrcHashIter++;
+            // An item still waiting in the bake queue, or baked and waiting for its build, is not idle: it has never
+            // been bound, so its last use is the frame it was requested in. Evicting it frees nothing (or throws a
+            // finished bake away), and an instance in a merged BLAS registers its micromap once, so the item never
+            // came back: with a queue longer than the trim age a part of the scene stayed without micromaps.
+            // An orphaned item has left the queue and is still trimmed.
+            const OpacityMicromapCacheItem& trimItem = cacheItemIter->second;
+            if (trimItem.isUnprocessedCacheStateListIterValid || trimItem.cacheState == OpacityMicromapCacheState::eStep2_Baked) {
+              ++keptInProgress;
+              continue;
+            }
             ++m_churn.evictions;
             ++trimmed;
             destroyOmmData(cacheItemIter);
           }
           Logger::info(str::format("[RTX Opacity Micromap] Trim: evicted ", trimmed, " micromaps unused for ", m_trimMinAgeFrames,
-                                   "+ traced frames, cache held ", usedBefore >> 20, " MiB, ", m_ommCache.size(), " micromaps remain"));
+                                   "+ traced frames, cache held ", usedBefore >> 20, " MiB, ", m_ommCache.size(), " micromaps remain, ",
+                                   keptInProgress, " old ones kept (queued for a bake or a build)"));
         }
       } else { // budget == 0
         if (m_memoryManager.getPrevBudget() > 0) {
